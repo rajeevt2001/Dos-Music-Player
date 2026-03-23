@@ -21,11 +21,11 @@ Menus preview
 
 Display settings will be available in the later versions
 
-![Settings](screenshots/display_settings.png)
+![Settings](screenshots/display_setting.png)
 
 Graphics settings with theme settings
 
-![Settings](screenshots/graphics_settings.png)
+![Settings](screenshots/graphics_setting.png)
 
 Other settings will be available in the later versions
 
