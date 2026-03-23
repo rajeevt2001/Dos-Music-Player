@@ -82,7 +82,7 @@ Other settings will be available in the later versions
 Display settings will be available in the later versions
 
 
-# Some preview screenshots with different theme setting applied
+## Some preview screenshots with different theme setting applied
 
 ![Settings](screenshots/graphics_settings_with_theme_applied.png)
 
