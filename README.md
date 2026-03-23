@@ -136,4 +136,5 @@ Using native .wav files, or using the internal Transcoder Cache to pre-convert M
 
 # Tested on
 DOS version 7.10 on DOSBox-X version 2025.12.01
+
 DOS 6.22 on Real Hardware with sbemu driver (AMD Ryzen 3200g)
