@@ -16,3 +16,17 @@ Main Screen with VU Meter visualizer, running under DOSBox
 Menus preview
 
 ![Menus](screenshots/file_menu.png)  .  ![Menus](screenshots/audio_menu.png)  .  ![Menus](screenshots/visual_menu.png)
+
+# Settings page
+
+Display settings will be available in the later versions
+
+![Settings](screenshots/display_settings.png)
+
+Graphics settings with theme settings
+
+![Settings](screenshots/graphics_settings.png)
+
+Other settings will be available in the later versions
+
+![Settings](screenshots/other_settings.png)
