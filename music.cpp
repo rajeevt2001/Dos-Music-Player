@@ -1,3 +1,5 @@
+//use the DJGPP's GCC compiler, made by Rajeev Tiwari with the help of Google Gemini.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <conio.h> 
