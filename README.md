@@ -31,6 +31,10 @@ Visual settings
 
 ![Settings](screenshots/visual_settings.png)
 
+# Some preview screenshots with different theme setting applied
+
+![Settings](screenshots/graphics_settings_with_theme_applied.png)
+
 Other settings will be available in the later versions
 
 ![Settings](screenshots/other_settings.png)
