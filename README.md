@@ -19,14 +19,20 @@ Menus preview
 
 # Settings page
 
-Display settings will be available in the later versions
+Audio Settings
 
-![Settings](screenshots/display_setting.png)
+![Settings](screenshots/audio_settings.png)
 
 Graphics settings with theme settings
 
 ![Settings](screenshots/graphics_setting.png)
 
+Visual settings
+
+![Settings](screenshots/visual_settings.png)
+
 Other settings will be available in the later versions
 
 ![Settings](screenshots/other_settings.png)
+
+Display settings will be available in the later versions
