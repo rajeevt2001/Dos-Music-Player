@@ -1,5 +1,4 @@
-//use the DJGPP's GCC compiler, made by Rajeev Tiwari with the help of Google Gemini.
-
+//Version 2.0 code, use the DJGPP's GCC compiler, made by Rajeev Tiwari with the help of Google Gemini.
 #include <stdio.h>
 #include <stdlib.h>
 #include <conio.h> 
@@ -22,17 +21,20 @@
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
 
-#define DSP_BASE   0x220
+int DSP_BASE = 0x220;
+int SB_IRQ = 7;
+int SB_DMA = 1;
+int SB_HDMA = 5; // <--- Add this for the 'H' variable!
+int IRQ_VECTOR = 15; 
+
 #define DSP_RESET  (DSP_BASE + 0x6)
 #define DSP_READ   (DSP_BASE + 0xA)
 #define DSP_WRITE  (DSP_BASE + 0xC)
 #define DSP_STATUS (DSP_BASE + 0xE)
 #define DSP_16_ACK (DSP_BASE + 0xF) 
 
-#define MIXER_ADDR 0x224
-#define MIXER_DATA 0x225
-#define SB_IRQ     7
-#define IRQ_VECTOR (SB_IRQ + 8) 
+#define MIXER_ADDR (DSP_BASE + 0x4)
+#define MIXER_DATA (DSP_BASE + 0x5)
 
 #define DMA8_MASK   0x0A
 #define DMA8_MODE   0x0B
@@ -74,6 +76,7 @@ int is_looping = 0;
 volatile int frames_decoded = 0;
 volatile int buffer_skips = 0;
 int pcm_leftover_bytes = 0;
+unsigned char pcm_leftover_buffer[32768]; // Huge 32KB overflow buffer to safely hold upsampled WAVs!
 
 int global_is_pc_speaker = 0;
 int config_is_pc_speaker = 0;
@@ -121,8 +124,9 @@ long start_off = 0;
 long file_size = 0;
 
 // --- NEW DISK STREAMING ENGINE GLOBALS ---
+#define STREAM_BUFFER_SIZE 5242880 //5mb Master Dial: Change this ONE number to resize the whole engine!
 FILE* active_audio_file = NULL;
-unsigned char stream_buffer[65536];
+unsigned char stream_buffer[STREAM_BUFFER_SIZE]; 
 int stream_bytes = 0;
 // -----------------------------------------
 
@@ -275,16 +279,41 @@ volatile int dma_play_pos = 0;
 volatile int pit_divisor = 108;
 volatile int pc_speaker_overdrive = 200; 
 
+// --- EMI DISK NOISE MUTE WRAPPER ---
+// Reads from the hard drive, but temporarily kills the motherboard's PC speaker logic gate
+// to prevent electromagnetic interference (EMI) from bleeding into the audio!
+int safe_disk_read(void* ptr, int size, int n, FILE* f) {
+    int was_on = 0;
+    if (global_is_pc_speaker) {
+        unsigned char state = inportb(0x61);
+        was_on = (state & 0x03) == 0x03; 
+        if (was_on) outportb(0x61, state & ~0x03); // Slam the logic gate shut!
+    }
+    
+    int res = fread(ptr, size, n, f);
+    
+    if (global_is_pc_speaker && was_on) {
+        outportb(0x61, inportb(0x61) | 0x03); // Open the logic gate back up!
+    }
+    return res;
+}
+
 void refill_stream() {
     if (!active_audio_file) return;
     int consumed = current_ram_ptr - stream_buffer;
     int remaining = stream_bytes - consumed;
     
-    // If we have less than 16KB of data left in the buffer, pull more from the hard drive!
-    if (remaining < 16384 && !feof(active_audio_file)) {
-        if (remaining > 0) memmove(stream_buffer, current_ram_ptr, remaining); // Slide leftovers to the front
-        int to_read = 65536 - remaining;
-        int bytes_read = fread(stream_buffer + remaining, 1, to_read, active_audio_file);
+    // --- THE MACRO CHUNKING FIX ---
+    // If we have less than 64KB left in the buffer, pull 2MB from the CF Card!
+    // We accept a ~1 second delay during the massive read, 
+    // to guarantee ~95 seconds of zero disk activity and flawless PC Speaker interrupts!
+    if (remaining < 65536 && !feof(active_audio_file)) {
+        if (remaining > 0) memmove(stream_buffer, current_ram_ptr, remaining);
+        int to_read = STREAM_BUFFER_SIZE - remaining;
+        
+        // --- THE EMI FIX ---
+        int bytes_read = safe_disk_read(stream_buffer + remaining, 1, to_read, active_audio_file);
+        
         stream_bytes = remaining + bytes_read;
         current_ram_ptr = stream_buffer;
     }
@@ -313,6 +342,8 @@ void save_playlist_m3u(const char* filepath);
 void load_playlist_m3u(const char* filepath, int append);
 void execute_browser_ok(); 
 void draw_media_info();
+void close_audio_engine();
+int init_audio_engine();
 
 
 // --- SETTINGS LOAD/SAVE ---
@@ -586,33 +617,54 @@ long wav_data_size = 0;
 long parse_wav_header(const char* filename, long *out_offset, int *out_channels, int *out_bitdepth, long *out_data_size) {
     FILE* file = fopen(filename, "rb"); 
     if (!file) return 0; 
+
+    // 1. Ultra-Resilient RIFF / ID3 bypass
+    // Scans the first 1024 bytes for the literal RIFF....WAVE signature.
+    // This safely bypasses corrupted ID3 tags, unpadded footers, or weird editor metadata!
+    unsigned char buf[1024];
+    int read_len = fread(buf, 1, 1024, file);
+    int is_wav = 0;
+    int riff_offset = 0;
+    for (int i = 0; i < read_len - 12; i++) {
+        if (buf[i] == 'R' && buf[i+1] == 'I' && buf[i+2] == 'F' && buf[i+3] == 'F' &&
+            buf[i+8] == 'W' && buf[i+9] == 'A' && buf[i+10] == 'V' && buf[i+11] == 'E') {
+            is_wav = 1;
+            riff_offset = i;
+            break;
+        }
+    }
+    if (!is_wav) { fclose(file); return 0; }
     
-    unsigned char header[12];
-    if (fread(header, 1, 12, file) == 12) {
-        if (header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F' &&
-            header[8] == 'W' && header[9] == 'A' && header[10] == 'V' && header[11] == 'E') {
+    // Jump straight to the first true chunk!
+    fseek(file, riff_offset + 12, SEEK_SET);
+    
+    long sr = 0;
+    unsigned char chunk[8];
+    
+    // 2. Parse chunks safely
+    while (fread(chunk, 1, 8, file) == 8) {
+        unsigned long chunk_size = chunk[4] | (chunk[5] << 8) | (chunk[6] << 16) | (chunk[7] << 24);
+        
+        if (chunk[0] == 'f' && chunk[1] == 'm' && chunk[2] == 't' && chunk[3] == ' ') {
+            unsigned char fmt[40] = {0}; 
+            // Failsafe: Prevent reading past chunk if chunk is weirdly small (e.g., 14 bytes)
+            int to_read = chunk_size > 40 ? 40 : chunk_size;
+            fread(fmt, 1, to_read, file);
             
-            unsigned char chunk[8];
-            long sr = 0;
-            while (fread(chunk, 1, 8, file) == 8) {
-                long chunk_size = chunk[4] | (chunk[5] << 8) | (chunk[6] << 16) | (chunk[7] << 24);
-                if (chunk[0] == 'f' && chunk[1] == 'm' && chunk[2] == 't' && chunk[3] == ' ') {
-                    unsigned char fmt[16];
-                    fread(fmt, 1, 16, file);
-                    *out_channels = fmt[2] | (fmt[3] << 8);
-                    sr = fmt[4] | (fmt[5] << 8) | (fmt[6] << 16) | (fmt[7] << 24);
-                    *out_bitdepth = fmt[14] | (fmt[15] << 8);
-                    if (chunk_size > 16) fseek(file, chunk_size - 16 + (chunk_size % 2), SEEK_CUR);
-                }
-                else if (chunk[0] == 'd' && chunk[1] == 'a' && chunk[2] == 't' && chunk[3] == 'a') {
-                    *out_offset = ftell(file);
-                    *out_data_size = chunk_size;
-                    fclose(file);
-                    return sr;
-                } else {
-                    fseek(file, chunk_size + (chunk_size % 2), SEEK_CUR);
-                }
-            }
+            *out_channels = fmt[2] | (fmt[3] << 8);
+            sr = fmt[4] | (fmt[5] << 8) | (fmt[6] << 16) | (fmt[7] << 24);
+            *out_bitdepth = fmt[14] | (fmt[15] << 8);
+            
+            if (chunk_size > to_read) fseek(file, chunk_size - to_read, SEEK_CUR);
+            if (chunk_size % 2 != 0) fseek(file, 1, SEEK_CUR); // Standard RIFF padding
+        }
+        else if (chunk[0] == 'd' && chunk[1] == 'a' && chunk[2] == 't' && chunk[3] == 'a') {
+            *out_offset = ftell(file);
+            *out_data_size = chunk_size;
+            fclose(file);
+            return sr;
+        } else {
+            fseek(file, chunk_size + (chunk_size % 2), SEEK_CUR);
         }
     }
     fclose(file); return 0;
@@ -775,7 +827,7 @@ void get_dsp_version(int *major, int *minor) {
 
 int reset_dsp() {
     outportb(DSP_RESET, 1); delay(10); outportb(DSP_RESET, 0); 
-    int timeout = 1000;
+    int timeout = 50000; // <--- Increased from 1000 for fast CPUs!
     while (timeout > 0) {
         if (inportb(DSP_STATUS) & 0x80) { if (inportb(DSP_READ) == 0xAA) return 1; }
         timeout--;
@@ -787,40 +839,113 @@ int setup_dma() {
     dos_buffer.size = (active_buffer_size * 2) / 16; 
     if (_go32_dpmi_allocate_dos_memory(&dos_buffer) != 0) return 0;
     unsigned long phys = dos_buffer.rm_segment * 16;
-    unsigned long page1 = phys / 131072UL;
+    
+    // CRITICAL H1 FIX: The boundary depends on the DMA CHIP, not the audio depth!
+    unsigned long boundary;
+    if (active_bitdepth == 16 && SB_HDMA >= 4) boundary = 131072UL; // True 16-bit Chip
+    else boundary = 65536UL; // 8-bit Chip (handles both 8-bit audio AND H1 16-bit audio)
+    
+    unsigned long page1 = phys / boundary;
     physical_addr = phys;
-
-    if (page1 != (phys + active_buffer_size - 1) / 131072UL) physical_addr = (page1 + 1) * 131072UL;
+    if (page1 != (phys + active_buffer_size - 1) / boundary) {
+        physical_addr = (page1 + 1) * boundary;
+    }
 
     unsigned char zero[4096]; memset(zero, (active_bitdepth == 8) ? 128 : 0, 4096); 
     for (int i = 0; i < active_buffer_size; i += 4096) dosmemput(zero, 4096, physical_addr + i);
 
     if (active_bitdepth == 16) {
-        outportb(DMA16_MASK, 0x05); outportb(DMA16_CLEAR, 0x00); outportb(DMA16_MODE, 0x59); 
-        unsigned long dma_addr = (physical_addr >> 1) & 0xFFFF;
-        outportb(DMA16_ADDR, (unsigned char)(dma_addr & 0xFF)); outportb(DMA16_ADDR, (unsigned char)((dma_addr >> 8) & 0xFF));
-        outportb(DMA16_PAGE, (unsigned char)((physical_addr >> 16) & 0xFE));
-        unsigned int dma_len = (unsigned int)((active_buffer_size / 2) - 1); 
-        outportb(DMA16_COUNT, (unsigned char)(dma_len & 0xFF)); outportb(DMA16_COUNT, (unsigned char)((dma_len >> 8) & 0xFF));
-        outportb(DMA16_MASK, 0x01); 
-    } else {
-        outportb(DMA8_MASK, 0x05); outportb(DMA8_CLEAR, 0x00); 
-        if (!has_auto_init) outportb(DMA8_MODE, 0x49); // Single-cycle playback for SB 1.x and DSP 2.00
-        else outportb(DMA8_MODE, 0x59);               // Auto-init playback for SB 2.01+ / Pro
+        if (SB_HDMA >= 4) {
+            // --- TRUE 16-BIT DMA ROUTE (Channels 4, 5, 6, 7) ---
+            int hdma_idx = SB_HDMA - 4; 
+            unsigned char dma_disable = 0x04 | hdma_idx; 
+            unsigned char dma_enable  = 0x00 | hdma_idx;
+            outportb(0xD4, dma_disable); outportb(0xD8, 0x00); 
+            if (!has_auto_init) outportb(0xD6, 0x48 | hdma_idx); else outportb(0xD6, 0x58 | hdma_idx);
+            
+            unsigned long dma_addr = (physical_addr >> 1) & 0xFFFF;
+            int port_addr = 0xC0 + (hdma_idx * 4); int port_count = port_addr + 2;
+            int port_page = 0x8B; if (SB_HDMA == 6) port_page = 0x89; else if (SB_HDMA == 7) port_page = 0x8A;
+            
+            outportb(port_addr, (unsigned char)(dma_addr & 0xFF)); outportb(port_addr, (unsigned char)((dma_addr >> 8) & 0xFF));
+            outportb(port_page, (unsigned char)((physical_addr >> 16) & 0xFE));
+            
+            unsigned int dma_len = (unsigned int)((active_buffer_size / 2) - 1); 
+            outportb(port_count, (unsigned char)(dma_len & 0xFF)); outportb(port_count, (unsigned char)((dma_len >> 8) & 0xFF));
+            outportb(0xD4, dma_enable); 
+        } else {
+            // --- 8-BIT DMA ROUTE FOR 16-BIT AUDIO (Channels 0, 1, 2, 3) (YOUR 486 H1 FIX!) ---
+            unsigned char dma_disable = 0x04 | SB_HDMA; 
+            unsigned char dma_enable  = 0x00 | SB_HDMA; 
+            outportb(0x0A, dma_disable); outportb(0x0C, 0x00);        
+            if (!has_auto_init) outportb(0x0B, 0x48 | SB_HDMA); else outportb(0x0B, 0x58 | SB_HDMA);               
+            
+            unsigned long dma_addr = physical_addr & 0xFFFF; 
+            int port_addr = SB_HDMA * 2; int port_count = port_addr + 1;
+            int port_page = 0x87; if (SB_HDMA == 1) port_page = 0x83; else if (SB_HDMA == 2) port_page = 0x81; else if (SB_HDMA == 3) port_page = 0x82;
+
+            outportb(port_addr, (unsigned char)(dma_addr & 0xFF)); outportb(port_addr, (unsigned char)((dma_addr >> 8) & 0xFF));
+            outportb(port_page, (unsigned char)((physical_addr >> 16) & 0xFF));
+            
+            unsigned int dma_len = (unsigned int)(active_buffer_size - 1); // Length in BYTES for the 8-bit chip
+            outportb(port_count, (unsigned char)(dma_len & 0xFF)); outportb(port_count, (unsigned char)((dma_len >> 8) & 0xFF));
+            outportb(0x0A, dma_enable); 
+        }
+    }
+    else {
+        // --- THE BUG WAS HERE! Correct Intel 8237 DMA Bitmasks ---
+        // Bit 2 is the MASK bit (4 = Disable, 0 = Enable). Bits 0-1 select the Channel.
+        unsigned char dma_disable = 0x04 | SB_DMA; 
+        unsigned char dma_enable  = 0x00 | SB_DMA; 
+        
+        outportb(DMA8_MASK, dma_disable); // Disable DMA while configuring
+        outportb(DMA8_CLEAR, 0x00);       // Clear byte pointer flip-flop
+        
+        // Mode: Single Transfer (0x40), Auto-Init (0x10), Read from Memory (0x08)
+        if (!has_auto_init) outportb(DMA8_MODE, 0x48 | SB_DMA); 
+        else outportb(DMA8_MODE, 0x58 | SB_DMA);               
         
         unsigned long dma_addr = physical_addr & 0xFFFF; 
-        outportb(DMA8_ADDR, (unsigned char)(dma_addr & 0xFF)); outportb(DMA8_ADDR, (unsigned char)((dma_addr >> 8) & 0xFF));
-        outportb(DMA8_PAGE, (unsigned char)((physical_addr >> 16) & 0xFF));
+        
+        int port_addr = SB_DMA * 2;
+        int port_count = port_addr + 1;
+        int port_page = 0x87;
+        if (SB_DMA == 1) port_page = 0x83;
+        else if (SB_DMA == 2) port_page = 0x81;
+        else if (SB_DMA == 3) port_page = 0x82;
+
+        outportb(port_addr, (unsigned char)(dma_addr & 0xFF)); 
+        outportb(port_addr, (unsigned char)((dma_addr >> 8) & 0xFF));
+        outportb(port_page, (unsigned char)((physical_addr >> 16) & 0xFF));
+        
         unsigned int dma_len = (unsigned int)(active_buffer_size - 1); 
-        outportb(DMA8_COUNT, (unsigned char)(dma_len & 0xFF)); outportb(DMA8_COUNT, (unsigned char)((dma_len >> 8) & 0xFF));
-        outportb(DMA8_MASK, 0x01); 
+        outportb(port_count, (unsigned char)(dma_len & 0xFF)); 
+        outportb(port_count, (unsigned char)((dma_len >> 8) & 0xFF));
+        
+        outportb(DMA8_MASK, dma_enable); // Finally, actually unmask and turn the hardware on!
     }
     return 1;
+}
+
+// --- PC SPEAKER LUT OPTIMIZATION ---
+unsigned char pc_speaker_lut[256];
+void build_speaker_lut() {
+    for (int i = 0; i < 256; i++) {
+        int s = i - 128;
+        s = (s * pc_speaker_overdrive) / 100;
+        if (s > 127) s = 127; if (s < -128) s = -128;
+        s = (s * master_volume) / 100;
+        int sample = s + 128;
+        unsigned int pwm = (sample * pit_divisor) >> 8; 
+        if (pwm == 0) pwm = 1;
+        pc_speaker_lut[i] = (unsigned char)pwm;
+    }
 }
 
 
 void set_volume(int vol) {
     if(vol < 0) vol = 0; if(vol > 100) vol = 100; master_volume = vol;
+    if (global_is_pc_speaker) build_speaker_lut(); // Recalculate if volume changes!
     if (!global_is_pc_speaker) {
         if (dsp_major >= 4) { // Sound Blaster 16
             unsigned char hw_vol = (unsigned char)(((vol * 31) / 100) << 3);
@@ -837,32 +962,32 @@ void set_volume(int vol) {
 }
 
 void speaker_handler() {
-    outportb(0x20, 0x20); interrupt_count++;
+    interrupt_count++;
     unsigned char sample = pc_speaker_dma[dma_play_pos]; dma_play_pos++;
     
     if (dma_play_pos == active_buffer_size / 2) refill_request = 1;
     else if (dma_play_pos >= active_buffer_size) { refill_request = 2; dma_play_pos = 0; }
     
-    int s = sample - 128;
-    s = (s * pc_speaker_overdrive) / 100; 
-    if (s > 127) s = 127; if (s < -128) s = -128;
+    // --- THE LUT OPTIMIZATION ---
+    // Instantly fetch the pre-calculated math!
+    outportb(0x42, pc_speaker_lut[sample]); 
     
-    s = (s * master_volume) / 100;
-    sample = (unsigned char)(s + 128);
-    
-    unsigned int pwm = (sample * pit_divisor) >> 8; if(pwm == 0) pwm = 1; 
-    outportb(0x42, pwm); 
+    // Send EOI at the END of the interrupt to prevent stack overflow!
+    outportb(0x20, 0x20); 
 }
+
 void speaker_handler_end() {}
 
 void sb_handler() {
     interrupt_count++;
     
-    // Ack interrupts based on hardware capabilities
-    inportb(DSP_STATUS); // Ack standard 8-bit
-    if (active_bitdepth == 16) inportb(DSP_16_ACK); // Ack 16-bit
+    // 1. CRITICAL: Acknowledge the DSP interrupt properly!
+    // Bulletproof method: Acknowledge BOTH latches safely. If the hardware gets confused 
+    // by an H3 mismatch, it might fire the wrong flag. This guarantees it clears.
+    inportb(DSP_BASE + 0x0E); 
+    inportb(DSP_BASE + 0x0F); 
     
-    // DSP 1.x & 2.00 workaround: Single-cycle DMA must be continually re-issued!
+    // 2. DSP 1.x & 2.00 workaround: Single-cycle DMA must be continually re-issued!
     if (!global_is_pc_speaker && !is_sb16 && !has_auto_init) {
         unsigned int dma_len = (active_buffer_size / 2) - 1;
         unsigned long dma_addr = physical_addr + ((interrupt_count % 2 == 1) ? (active_buffer_size / 2) : 0);
@@ -881,8 +1006,11 @@ void sb_handler() {
         write_dsp((unsigned char)((dma_len >> 8) & 0xFF));
     }
     
-    outportb(0x20, 0x20); // End of Interrupt to PIC
+    // 3. Send End-Of-Interrupt to Motherboard PIC
+    outportb(0x20, 0x20); 
+    if (SB_IRQ >= 8) outportb(0xA0, 0x20); // Ack the slave PIC if IRQ 8-15
     
+    // 4. CRITICAL: Tell the main loop to refill the buffer!
     if (interrupt_count % 2 == 1) refill_request = 1; else refill_request = 2;
 }
 void sb_handler_end() {}
@@ -1216,10 +1344,10 @@ void init_ui(const char* filename) {
         
         draw_frame(0, 0, 79, 24, bg);
         set_char(2, 0, 0xC3, bg); for(int i=1; i<79; i++) set_char(2, i, 0xC4, bg); set_char(2, 79, 0xB4, bg);
-        if (strlen(base_filename) < 45){
+        if (strlen(base_filename) <= 48){
             print_fmt(1, 2, bg, "File \xB3 Audio \xB3 Visual \xB3 %s", base_filename); 
         }
-        else if (strlen(base_filename) >= 49){
+        else {
             print_fmt(1, 2, bg, "File \xB3 Audio \xB3 Visual \xB3 %.45s...", base_filename); 
         }
         print_text(1, 75, "\xB3 X ", bg); 
@@ -1294,10 +1422,27 @@ void init_ui(const char* filename) {
 
 unsigned char mouse_arrow[16] = { 0x00, 0x00, 0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC, 0xFE, 0xFF, 0xFF, 0xF8, 0xEC, 0xCC, 0x86, 0x02 };
 void load_cursor_glyph() { __dpmi_regs regs; dosmemput(mouse_arrow, 16, __tb); regs.x.ax = 0x1100; regs.x.bx = 0x1000; regs.x.cx = 0x0001; regs.x.dx = CURSOR_CHAR; regs.x.es = __tb / 16; regs.x.bp = __tb & 15; __dpmi_int(0x10, &regs); }
-void show_mouse() { union REGS regs; regs.x.ax = SHOW_MOUSE; int86(MOUSE_INT, &regs, &regs); }
-void hide_mouse() { union REGS regs; regs.x.ax = HIDE_MOUSE; int86(MOUSE_INT, &regs, &regs); }
-int init_mouse() { union REGS regs; regs.x.ax = INIT_MOUSE; int86(MOUSE_INT, &regs, &regs); if (regs.x.ax == 0xFFFF) { load_cursor_glyph(); regs.x.ax = 0x000A; regs.x.bx = 0x0000; regs.x.cx = 0xF000; regs.x.dx = 0x0F00 | CURSOR_CHAR; int86(MOUSE_INT, &regs, &regs); show_mouse(); has_mouse = 1; return 1; } return 0; }
-void update_mouse() { union REGS regs; regs.x.ax = GET_MOUSE_STATUS; int86(MOUSE_INT, &regs, &regs); mouse_x = regs.x.cx / 8; mouse_y = regs.x.dx / 8; mouse_left = (regs.x.bx & 1); mouse_right = (regs.x.bx & 2); }
+void show_mouse() { if (!has_mouse) return; union REGS regs; regs.x.ax = SHOW_MOUSE; int86(MOUSE_INT, &regs, &regs); }
+void hide_mouse() { if (!has_mouse) return; union REGS regs; regs.x.ax = HIDE_MOUSE; int86(MOUSE_INT, &regs, &regs); }
+int init_mouse() {
+    // CRITICAL: Prevent resetting the driver if it is already active!
+    // This stops INT 33h from deleting our custom cursor graphics on song load.
+    if (has_mouse) return 1; 
+    
+    // Safety Check: Validate interrupt vector 0x33 before calling it!
+    unsigned long vec = _farpeekl(_dos_ds, 0x33 * 4);
+    if (vec == 0) { has_mouse = 0; return 0; }
+    unsigned char first_byte = _farpeekb(_dos_ds, ((vec >> 16) << 4) + (vec & 0xFFFF));
+    if (first_byte == 0xCF) { has_mouse = 0; return 0; } // 0xCF is a dummy IRET
+
+    union REGS regs; regs.x.ax = INIT_MOUSE; int86(MOUSE_INT, &regs, &regs); 
+    if (regs.x.ax == 0xFFFF) { 
+        load_cursor_glyph(); regs.x.ax = 0x000A; regs.x.bx = 0x0000; regs.x.cx = 0xF000; regs.x.dx = 0x0F00 | CURSOR_CHAR; 
+        int86(MOUSE_INT, &regs, &regs); show_mouse(); has_mouse = 1; return 1; 
+    } 
+    has_mouse = 0; return 0; 
+}
+void update_mouse() { if (!has_mouse) return; union REGS regs; regs.x.ax = GET_MOUSE_STATUS; int86(MOUSE_INT, &regs, &regs); mouse_x = regs.x.cx / 8; mouse_y = regs.x.dx / 8; mouse_left = (regs.x.bx & 1); mouse_right = (regs.x.bx & 2); }
 
 // --- UI DRAWING FUNCTIONS ---
 void draw_visualizer() {
@@ -2456,70 +2601,71 @@ void draw_menu() {
     static int last_menu = -1;
     static int last_hover = -1;
     static int last_view = -1;
-    int current_hover = -1;
+    
+    // Preserve the keyboard's hover state by default!
+    int current_hover = active_menu_hover; 
 
-    if (active_menu == 1) { 
-        if (mouse_x >= 1 && mouse_x <= 16) {
-            if (mouse_y == 3) current_hover = 0;
-            else if (mouse_y == 4) current_hover = 1;
-            else if (mouse_y == 5) current_hover = 2; // Media Info
-            else if (mouse_y == 6) current_hover = 3; // Shifted Settings
-            else if (mouse_y == 8) current_hover = 4; // Shifted Exit
-            else if (mouse_y == 0) current_hover = 17;
-            else if (mouse_y == 1) current_hover = 17; 
-            else if (mouse_y == 2) current_hover = 17;  
-            //else if (mouse_y == 8) current_hover = 17;
-            else if (mouse_y == 9) current_hover = 17;
+    // ONLY let the mouse override the hover state if it physically moved!
+    static int last_mx = -1, last_my = -1;
+    if (has_mouse) {
+        int mouse_moved = (mouse_x != last_mx || mouse_y != last_my);
+        last_mx = mouse_x; last_my = mouse_y;
+        
+        int temp_hover = -1;
+        if (active_menu == 1) { 
+            if (mouse_x >= 1 && mouse_x <= 16) {
+                if (mouse_y == 3) temp_hover = 0;
+                else if (mouse_y == 4) temp_hover = 1;
+                else if (mouse_y == 5) temp_hover = 2; // Media Info
+                else if (mouse_y == 6) temp_hover = 3; // Shifted Settings
+                else if (mouse_y == 8) temp_hover = 4; // Shifted Exit
+                else if (mouse_y == 0 || mouse_y == 1 || mouse_y == 2 || mouse_y == 9) temp_hover = 17;
+            }
+            else if(mouse_x == 0 || mouse_x == 17) temp_hover = 17;
+        } 
+        else if (active_menu == 2) { 
+            if (mouse_x >= 8 && mouse_x <= 32) {
+                if (mouse_y == 3) temp_hover = 0;
+                else if (mouse_y == 4) temp_hover = 1;
+                else if (mouse_y == 6) temp_hover = 2;
+                else if (mouse_y == 7) temp_hover = 3; 
+                else if (mouse_y == 9) temp_hover = 4; 
+                else if (mouse_y == 10) temp_hover = 5;
+                else if (mouse_y == 0 || mouse_y == 1 || mouse_y == 2 || mouse_y == 11 || mouse_y == 12) temp_hover = 17;
+            }
+            else if(mouse_x == 7 || mouse_x == 33) temp_hover = 17;
+        } 
+        else if (active_menu == 3) { 
+            if (mouse_x >= 16 && mouse_x <= 35) {
+                if (mouse_y == 3) temp_hover = 0; 
+                else if (mouse_y == 4) temp_hover = 1; 
+                else if (mouse_y == 5) temp_hover = 2; 
+                else if (mouse_y == 7) temp_hover = 3;
+                else if (mouse_y == 0 || mouse_y == 1 || mouse_y == 2 || mouse_y == 8 || mouse_y == 9) temp_hover = 17;
+            }
+            else if(mouse_x == 15 || mouse_x == 36) temp_hover = 17;
         }
-        else if(mouse_x == 0 || mouse_x == 17){
-            current_hover = 17;
-        }
-    } 
-    else if (active_menu == 2) { 
-        if (mouse_x >= 8 && mouse_x <= 32) {
-            if (mouse_y == 3) current_hover = 0;
-            else if (mouse_y == 4) current_hover = 1;
-            else if (mouse_y == 6) current_hover = 2;
-            else if (mouse_y == 7) current_hover = 3; 
-            else if (mouse_y == 9) current_hover = 4; 
-            else if (mouse_y == 10) current_hover = 5;
-            else if (mouse_y == 0) current_hover = 17;
-            else if (mouse_y == 1) current_hover = 17; 
-            else if (mouse_y == 2) current_hover = 17; 
-            else if (mouse_y == 11) current_hover = 17;
-            else if (mouse_y == 12) current_hover = 17;
-        }
-        else if(mouse_x == 7 || mouse_x == 33){
-            current_hover = 17;
-        }
-    } 
-    else if (active_menu == 3) { 
-        if (mouse_x >= 16 && mouse_x <= 35) {
-            if (mouse_y == 3) current_hover = 0; 
-            else if (mouse_y == 4) current_hover = 1; 
-            else if (mouse_y == 5) current_hover = 2; 
-            else if (mouse_y == 7) current_hover = 3;
-            else if (mouse_y == 0) current_hover = 17;
-            else if (mouse_y == 1) current_hover = 17; 
-            else if (mouse_y == 2) current_hover = 17; 
-            else if (mouse_y == 8) current_hover = 17;
-            else if (mouse_y == 9) current_hover = 17;
-        }
-        else if(mouse_x == 15 || mouse_x == 36){
-            current_hover = 17;
+        
+        // If the mouse moved, it steals focus from the keyboard. 
+        // Otherwise, it respects your Arrow Keys!
+        if (mouse_moved) {
+            current_hover = temp_hover;
+            active_menu_hover = current_hover; 
         }
     }
 
-    if (active_menu == last_menu && current_hover == last_hover && ui_view == last_view) return;
+    // Use active_menu_hover for the redraw check so keyboard changes trigger paints!
+
+    // Use active_menu_hover for the redraw check so keyboard changes trigger paints!
+    if (active_menu == last_menu && active_menu_hover == last_hover && ui_view == last_view) return;
 
     if (has_mouse) hide_mouse();
     
     int menu_just_opened = (active_menu != last_menu || ui_view != last_view);
     
     last_menu = active_menu;
-    last_hover = current_hover;
+    last_hover = active_menu_hover; // Track the TRUE hover state
     last_view = ui_view;
-    active_menu_hover = current_hover;
 
     if (active_menu == 0) {
         if (has_mouse) show_mouse();
@@ -2698,6 +2844,7 @@ void load_new_file_from_browser(const char* filepath) {
     init_ui(app_filename); draw_visualizer(); if (has_mouse) show_mouse();
 
     if (active_audio_file) { fclose(active_audio_file); active_audio_file = NULL; }
+    close_audio_engine(); // MUST free DOS memory and unhook interrupts before loading a new song!
     
     // --- NEW: DUAL HEADER PARSING ---
     start_off = 0; file_is_native_wav = 0; current_bitdepth = 16; wav_data_size = 0;
@@ -2715,20 +2862,47 @@ void load_new_file_from_browser(const char* filepath) {
     // --------------------------------
 
     target_sample_rate = global_out_sample_rate; target_channels = global_out_channels;
+
+    // --- PC SPEAKER 22KHz CARRIER FIX ---
+    if (global_is_pc_speaker) {
+        target_channels = 1;
+        active_bitdepth = 8;
+        if (custom_sample_rate > 0) target_sample_rate = custom_sample_rate;
+        else target_sample_rate = 22050; // Push PWM carrier to ultrasonic range!
+    } else {
+        active_bitdepth = is_sb16 ? 16 : 8;
+    }
+    
     resample_step = ((unsigned long long)current_sample_rate << 16) / target_sample_rate; resample_pos = 0;
     
     FILE *mp3_file = fopen(filepath, "rb");
     if (!mp3_file) { strcpy(browser_status_msg, "Error: Could not open file!"); has_active_file = 0; return; }
-    fseek(mp3_file, 0, SEEK_END); file_size = ftell(mp3_file); 
+    
+    // Get total file size for the percentage bar SAFELY
+    fseek(mp3_file, 0, SEEK_END);
+    long total_mp3_size = ftell(mp3_file);
+    fseek(mp3_file, 0, SEEK_SET);
+    
+    long bytes_processed = 0;
+    int last_drawn_percent = -1; // -1 ensures it draws 0% immediately
+    file_size = total_mp3_size; // Redundant fseek removed!
     if (start_off > file_size) start_off = 0; 
     
-    if (global_is_486 && !file_is_native_wav) {
+    // Force High-Res WAVs to generate an offline cache file ONLY if PC Speaker is active!
+    int needs_wav_downsample = file_is_native_wav && (current_sample_rate != target_sample_rate || current_channels != target_channels || current_bitdepth != active_bitdepth);
+    if (global_is_486 && (!file_is_native_wav || (global_is_pc_speaker && needs_wav_downsample))) {
         int conversion_success = 0, active_divisor = CONF_486_DIVISOR;
         while (!conversion_success && active_divisor <= 4) {
             if (!global_is_pc_speaker && custom_sample_rate == 0) { 
                 target_sample_rate = current_sample_rate / active_divisor; 
-                if (is_sb16 && target_sample_rate > 44100) target_sample_rate = 44100; 
                 
+                // --- 486 SOUND BLASTER STABILITY FIX ---
+                if (global_is_486) {
+                    if (target_sample_rate > 22050) target_sample_rate = 22050; // Cap at 22k for 486
+                } else {
+                    if (is_sb16 && target_sample_rate > 44100) target_sample_rate = 44100; 
+                }
+            
                 // --- APPLY SB PRO 1MHz HARDWARE LIMITS TO TRANSCODER ---
                 if (!is_sb16 && dsp_major == 3) {
                     if (target_channels == 2 && target_sample_rate > 22050) target_sample_rate = 22050;
@@ -2740,7 +2914,13 @@ void load_new_file_from_browser(const char* filepath) {
                 
                 resample_step = ((unsigned long long)current_sample_rate << 16) / target_sample_rate; 
             }
-            if (has_mouse) hide_mouse(); print_fmt(17, 6, get_accent_color(), "[ 486 OPTIMIZATION: Transcoding MP3 to WAV (1/%d Quality) ]", active_divisor); if (has_mouse) show_mouse();
+            if (has_mouse) hide_mouse(); 
+            if (file_is_native_wav) {
+                print_fmt(17, 6, get_accent_color(), "[ 486 OPTIMIZATION: Downsampling WAV to WAV (1/%d Quality) ]", active_divisor); 
+            } else {
+                print_fmt(17, 6, get_accent_color(), "[ 486 OPTIMIZATION: Transcoding MP3 to WAV (1/%d Quality) ]", active_divisor); 
+            }
+            if (has_mouse) show_mouse();
             
             FILE *wav_file = fopen("486_temp.wav", "wb+");
             if (wav_file) {
@@ -2748,51 +2928,125 @@ void load_new_file_from_browser(const char* filepath) {
                 mp3dec_t temp_mp3d; mp3dec_init(&temp_mp3d); mp3dec_frame_info_t temp_info; 
                 
                 // Mount MP3 to our streaming engine temporarily!
+                // Mount MP3 to our streaming engine temporarily!
                 active_audio_file = mp3_file; fseek(active_audio_file, start_off, SEEK_SET);
-                stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); current_ram_ptr = stream_buffer;
+                stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); current_ram_ptr = stream_buffer;
                 long trans_bytes_left = file_size - start_off; int total_wav_bytes = 0, disk_full = 0;
+                
+                // --- PROGRESS BAR GLOBALS ---
+                long total_transcode_bytes = trans_bytes_left; if (total_transcode_bytes <= 0) total_transcode_bytes = 1;
+                int last_drawn_percent = -1;
+                // ----------------------------
                 
                 while (trans_bytes_left > 0) {
                     refill_stream(); // Uses the 64K sliding window!
                     int avail = stream_bytes - (current_ram_ptr - stream_buffer);
-                    int samples = mp3dec_decode_frame(&temp_mp3d, current_ram_ptr, avail, pcm_temp, &temp_info);
+                    int samples = 0;
+                    if (!file_is_native_wav) {
+                        samples = mp3dec_decode_frame(&temp_mp3d, current_ram_ptr, avail, pcm_temp, &temp_info);
+                    } else {
+                        // --- NATIVE WAV OFFLINE DOWNSAMPLER ---
+                        int bps = current_channels * (current_bitdepth / 8); if (bps == 0) bps = 1;
+                        int frames = (sizeof(pcm_temp) / 2) / current_channels; if (frames > 1152) frames = 1152;
+                        int bytes = frames * bps; if (bytes > avail) bytes = avail - (avail % bps);
+                        if (bytes > trans_bytes_left) bytes = trans_bytes_left - (trans_bytes_left % bps);
+                        if (bytes > 0) {
+                            if (current_bitdepth == 8) { unsigned char* w8 = (unsigned char*)current_ram_ptr; for (int i=0; i < (bytes/bps)*current_channels; i++) pcm_temp[i] = (w8[i] - 128) << 8; }
+                            else memcpy(pcm_temp, current_ram_ptr, bytes);
+                            current_ram_ptr += bytes; trans_bytes_left -= bytes; samples = bytes / bps;
+                        } else { trans_bytes_left = 0; }
+                    }
                     if (samples > 0) {
                         int out_samples = samples; short* final_pcm_ptr = pcm_temp;
                         if (current_sample_rate != target_sample_rate || current_channels != target_channels) {
-                            out_samples = 0; unsigned int temp_resample_pos = 0;
-                            while ((temp_resample_pos >> 16) < samples) {
-                                int src_idx = temp_resample_pos >> 16; unsigned int frac = temp_resample_pos & 0xFFFF;
-                                if (src_idx >= samples - 1) { if (target_channels == 2 && current_channels == 2) { resampled_temp[out_samples*2] = pcm_temp[src_idx*2]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx*2+1]; } else if (target_channels == 1 && current_channels == 2) { resampled_temp[out_samples] = (pcm_temp[src_idx*2] >> 1) + (pcm_temp[src_idx*2+1] >> 1); } else if (target_channels == 2 && current_channels == 1) { resampled_temp[out_samples*2] = pcm_temp[src_idx]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx]; } else resampled_temp[out_samples] = pcm_temp[src_idx]; } 
-                                else { if (target_channels == 2 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; resampled_temp[out_samples*2] = L0 + (((L1 - L0) * (int)frac) >> 16); resampled_temp[out_samples*2+1] = R0 + (((R1 - R0) * (int)frac) >> 16); } else if (target_channels == 1 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; int M0=(L0>>1)+(R0>>1), M1=(L1>>1)+(R1>>1); resampled_temp[out_samples] = M0 + (((M1 - M0) * (int)frac) >> 16); } else if (target_channels == 2 && current_channels == 1) { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; int val = S0 + (((S1 - S0) * (int)frac) >> 16); resampled_temp[out_samples*2] = val; resampled_temp[out_samples*2+1] = val; } else { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; resampled_temp[out_samples] = S0 + (((S1 - S0) * (int)frac) >> 16); } }
-                                out_samples++; temp_resample_pos += resample_step;
+                            // --- FAST-PATH DOWNSAMPLERS FOR OFFLINE CACHE GENERATION ---
+                            if (global_is_pc_speaker) {
+                                out_samples = 0; unsigned int temp_resample_pos = 0;
+                                while ((temp_resample_pos >> 16) < samples) {
+                                    int src_idx = temp_resample_pos >> 16;
+                                    if (current_channels == 2) resampled_temp[out_samples++] = (pcm_temp[src_idx*2] >> 1) + (pcm_temp[src_idx*2+1] >> 1);
+                                    else resampled_temp[out_samples++] = pcm_temp[src_idx];
+                                    temp_resample_pos += resample_step;
+                                }
+                                final_pcm_ptr = resampled_temp;
+                            } else if (global_is_486 && current_channels == 2 && target_channels == 1 && resample_step == 131072) {
+                                out_samples = 0;
+                                for (int i = 0; i < samples; i += 2) {
+                                    resampled_temp[out_samples++] = (pcm_temp[i*2] >> 1) + (pcm_temp[i*2+1] >> 1);
+                                }
+                                final_pcm_ptr = resampled_temp;
+                            } else {
+                                out_samples = 0; unsigned int temp_resample_pos = 0;
+                                while ((temp_resample_pos >> 16) < samples) {
+                                    int src_idx = temp_resample_pos >> 16; unsigned int frac = temp_resample_pos & 0xFFFF;
+                                    if (src_idx >= samples - 1) { if (target_channels == 2 && current_channels == 2) { resampled_temp[out_samples*2] = pcm_temp[src_idx*2]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx*2+1]; } else if (target_channels == 1 && current_channels == 2) { resampled_temp[out_samples] = (pcm_temp[src_idx*2] >> 1) + (pcm_temp[src_idx*2+1] >> 1); } else if (target_channels == 2 && current_channels == 1) { resampled_temp[out_samples*2] = pcm_temp[src_idx]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx]; } else resampled_temp[out_samples] = pcm_temp[src_idx]; } 
+                                    else { if (target_channels == 2 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; resampled_temp[out_samples*2] = L0 + (((L1 - L0) * (int)frac) >> 16); resampled_temp[out_samples*2+1] = R0 + (((R1 - R0) * (int)frac) >> 16); } else if (target_channels == 1 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; int M0=(L0>>1)+(R0>>1), M1=(L1>>1)+(R1>>1); resampled_temp[out_samples] = M0 + (((M1 - M0) * (int)frac) >> 16); } else if (target_channels == 2 && current_channels == 1) { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; int val = S0 + (((S1 - S0) * (int)frac) >> 16); resampled_temp[out_samples*2] = val; resampled_temp[out_samples*2+1] = val; } else { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; resampled_temp[out_samples] = S0 + (((S1 - S0) * (int)frac) >> 16); } }
+                                    out_samples++; temp_resample_pos += resample_step;
+                                }
+                                final_pcm_ptr = resampled_temp;
                             }
-                            final_pcm_ptr = resampled_temp;
                         }
                         int final_total_samples = out_samples * target_channels; int expected_bytes = 0, written_bytes = 0;
                         if (active_bitdepth == 8) { unsigned char out_8bit[MINIMP3_MAX_SAMPLES_PER_FRAME * 2]; for (int i = 0; i < final_total_samples; i++) out_8bit[i] = (unsigned char)((final_pcm_ptr[i] >> 8) + 128); expected_bytes = final_total_samples; written_bytes = fwrite(out_8bit, 1, expected_bytes, wav_file); } else { expected_bytes = final_total_samples * 2; written_bytes = fwrite(final_pcm_ptr, 1, expected_bytes, wav_file); }
                         if (written_bytes != expected_bytes) { disk_full = 1; break; } total_wav_bytes += written_bytes;
                     }
                     if (disk_full) break;
-                    if (temp_info.frame_bytes > 0) { current_ram_ptr += temp_info.frame_bytes; trans_bytes_left -= temp_info.frame_bytes; } else { current_ram_ptr++; trans_bytes_left--; }
+                    if (!file_is_native_wav) {
+                        if (temp_info.frame_bytes > 0) { current_ram_ptr += temp_info.frame_bytes; trans_bytes_left -= temp_info.frame_bytes; } else { current_ram_ptr++; trans_bytes_left--; }
+                    }
+                    
+                    // --- PROGRESS BAR UPDATE ---
+                    int percent = 100 - ((trans_bytes_left * 100) / total_transcode_bytes);
+                    if (percent < 0) percent = 0; if (percent > 100) percent = 100;
+                    if (percent != last_drawn_percent) {
+                        if (has_mouse) hide_mouse();
+                        print_fmt(17, 65, get_accent_color(), "%3d%%", percent);
+                        if (has_mouse) show_mouse();
+                        last_drawn_percent = percent;
+                    }
+                    // ---------------------------
                 }
+                
+                if (has_mouse) hide_mouse(); print_text(17, 65, "Done", get_accent_color()); if (has_mouse) show_mouse();
+                
                 if (disk_full) { fclose(wav_file); remove("486_temp.wav"); active_divisor++; continue; }
                 rewind(wav_file); write_wav_header(wav_file, target_sample_rate, target_channels, active_bitdepth, total_wav_bytes);
                 
                 global_wav_bytes = total_wav_bytes; ui_total_seconds = total_wav_bytes / (target_sample_rate * target_channels * (active_bitdepth / 8)); conversion_success = 1;
                 
                 // Mount the WAV file for streaming playback!
-                fclose(mp3_file);
-                active_audio_file = wav_file; 
-                fseek(active_audio_file, 44, SEEK_SET); // Skip WAV header
-            } else return;
-            if (global_is_pc_speaker || custom_sample_rate > 0) break;
+                    fclose(mp3_file);
+                    active_audio_file = wav_file; 
+                    
+                    // --- THE FAST-FORWARD FIX ---
+                    // Tell the playback engine the active file is now the 
+                    // newly created 8-bit Mono cache file, not the original high-res file!
+                    file_is_native_wav = 1;
+                    current_sample_rate = target_sample_rate;
+                    current_channels = target_channels;
+                    current_bitdepth = active_bitdepth;
+                    start_off = 44;
+                    wav_data_size = total_wav_bytes;
+                    resample_step = 65536; // Lock resampler ratio to 1.0x
+                    // ----------------------------
+                    
+                    fseek(active_audio_file, start_off, SEEK_SET); 
+                } else return;
+                if (global_is_pc_speaker || custom_sample_rate > 0) break;
         }
         if (!conversion_success) { if(active_audio_file) fclose(active_audio_file); return; }
     } else {
+        if (global_is_486 && file_is_native_wav) {
+            if (has_mouse) hide_mouse(); 
+            print_fmt(17, 6, get_accent_color(), "[ 486 OPTIMIZATION: File is already WAV. Bypassing transcoder! ]"); 
+            if (has_mouse) show_mouse();
+            delay(800); // Give the user a moment to see the confirmation!
+        }
+        
         // Mount the MP3 file for streaming playback!
         active_audio_file = mp3_file;
         fseek(active_audio_file, start_off, SEEK_SET);
-        stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file);
+        stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file);
         current_ram_ptr = stream_buffer;
         
         if (!file_is_native_wav) {
@@ -2809,11 +3063,37 @@ void load_new_file_from_browser(const char* filepath) {
         }
     }
     
-    has_id3 = 0; memset(id3_title, 0, 31); memset(id3_artist, 0, 31); parse_id3(filepath);
+    has_id3 = 0; memset(id3_title, 0, 31); memset(id3_artist, 0, 31); 
     
     if (has_mouse) hide_mouse();
-    print_text(16, 6, "                                                  ", get_bg_color()); print_text(17, 6, "                                                                ", get_bg_color()); force_ui_redraw = 1; init_ui(app_filename); if (has_mouse) show_mouse();
-    ui_total_samples_played = 0; frames_decoded = 0; buffer_skips = 0; pcm_leftover_bytes = 0; has_active_file = 1; is_paused = 0; strcpy(browser_status_msg, ""); 
+    print_text(16, 6, "                                                  ", get_bg_color()); 
+    print_text(17, 6, "                                                                ", get_bg_color()); 
+    
+    has_active_file = 1; // Must be set BEFORE init so ID3 parsing triggers
+    
+    // --- 486 DIRECT PLAY OPTIMIZATION ---
+    if (global_is_486 && file_is_native_wav) {
+        if (!global_is_pc_speaker) {
+            target_sample_rate = current_sample_rate;
+            target_channels = current_channels;
+            if (is_sb16) active_bitdepth = current_bitdepth;
+        }
+        
+        // --- THE 0.37s SKIP FIX ---
+        fseek(active_audio_file, start_off, SEEK_SET); 
+    }
+    
+    // --- THE FATAL OMISSION FIX ---
+    // Wake the Sound Blaster back up! This safely re-allocates the DOS memory, 
+    // hooks the hardware IRQ, and rebuilds the UI.
+    init_audio_engine();
+    
+    ui_total_samples_played = 0; frames_decoded = 0; buffer_skips = 0; 
+    pcm_leftover_bytes = 0; 
+    refill_request = 0; interrupt_count = 0; // Clear stale hardware signals!
+    
+    is_paused = 0; strcpy(browser_status_msg, ""); 
+    if (has_mouse) show_mouse();
 }
 
 void save_playlist_m3u(const char* filepath) { // <--- ADD PARAMETER
@@ -3153,11 +3433,19 @@ void update_ui(int current_sec, int total_sec) {
 }
 
 int init_audio_engine(){
+    // 16-BIT TEST: Bypassing the H3 8-bit RAM mixdown!
+    // if (is_sb16 && SB_HDMA < 4) active_bitdepth = 8; 
+
     global_out_sample_rate = target_sample_rate; global_out_channels = target_channels;
     if (has_active_file) parse_id3(app_filename); 
     set_volume(master_volume); init_ui(app_filename); init_mouse(); 
 
-    if (global_is_pc_speaker) {//pc speaker output
+    if (global_is_pc_speaker) {
+        // --- PIT TIMER RECALCULATION FIX ---
+        // Dynamically adjust the PWM hardware timer to match the song's target rate!
+        pit_divisor = 1193180 / target_sample_rate;
+        build_speaker_lut(); // Calculate the math table before hooking!
+        
         memset(pc_speaker_dma, 128, active_buffer_size);
         _go32_dpmi_lock_code((void *)speaker_handler, (unsigned long)speaker_handler_end - (unsigned long)speaker_handler);
         _go32_dpmi_lock_data((void *)&interrupt_count, sizeof(interrupt_count));
@@ -3168,6 +3456,7 @@ int init_audio_engine(){
         _go32_dpmi_lock_data((void *)&master_volume, sizeof(master_volume));
         _go32_dpmi_lock_data((void *)&active_buffer_size, sizeof(active_buffer_size));
         _go32_dpmi_lock_data((void *)&pc_speaker_overdrive, sizeof(pc_speaker_overdrive));
+        _go32_dpmi_lock_data((void *)&pc_speaker_lut, sizeof(pc_speaker_lut)); // Lock the table!
         new_isr.pm_offset = (unsigned long)speaker_handler;
         new_isr.pm_selector = _go32_my_cs();
         _go32_dpmi_get_protected_mode_interrupt_vector(0x08, &old_isr);
@@ -3176,10 +3465,9 @@ int init_audio_engine(){
         outportb(0x43, 0x36); outportb(0x40, pit_divisor & 0xFF);
         outportb(0x40, (pit_divisor >> 8) & 0xFF); outportb(0x43, 0x90); outportb(0x61, inportb(0x61) | 0x03); 
     } 
-    else {//sound blaster output
+    else {
         if (!setup_dma()) return 1;
         
-        // Critical: Lock all variables the interrupt relies on to prevent DPMI page faults
         _go32_dpmi_lock_code((void *)sb_handler, (unsigned long)sb_handler_end - (unsigned long)sb_handler); 
         _go32_dpmi_lock_data((void *)&interrupt_count, sizeof(interrupt_count)); 
         _go32_dpmi_lock_data((void *)&refill_request, sizeof(refill_request));
@@ -3192,101 +3480,129 @@ int init_audio_engine(){
 
         new_isr.pm_offset = (unsigned long)sb_handler; new_isr.pm_selector = _go32_my_cs(); _go32_dpmi_get_protected_mode_interrupt_vector(IRQ_VECTOR, &old_isr); _go32_dpmi_allocate_iret_wrapper(&new_isr); _go32_dpmi_set_protected_mode_interrupt_vector(IRQ_VECTOR, &new_isr);
         
-        outportb(0x21, inportb(0x21) & ~(1 << SB_IRQ)); // Unmask IRQ
-        
-        write_dsp(0xD1); // Speaker ON
+        outportb(0x21, inportb(0x21) & ~(1 << SB_IRQ)); 
+        write_dsp(0xD1); 
         
         if (is_sb16) {
+            // 16-BIT TEST: Bypassing the final H3 hardware lock!
+            // if (SB_HDMA < 4) active_bitdepth = 8;
+            
             write_dsp(0x41); write_dsp((unsigned char)((target_sample_rate >> 8) & 0xFF)); write_dsp((unsigned char)(target_sample_rate & 0xFF));
-            unsigned int block_size = ((active_buffer_size / 2) / 2) - 1; // 16-bit block format
-            int dsp_cmd = (target_channels == 2) ? 0xB6 : 0xC6; 
-            int dsp_mode = (target_channels == 2) ? 0x30 : 0x10; 
-            write_dsp(dsp_cmd); write_dsp(dsp_mode); write_dsp((unsigned char)(block_size & 0xFF)); write_dsp((unsigned char)((block_size >> 8) & 0xFF));
+            
+            if (active_bitdepth == 16) {
+                unsigned int block_size = ((active_buffer_size / 2) / 2) - 1; 
+                int dsp_cmd = (target_channels == 2) ? 0xB6 : 0xC6; // 16-bit Auto-Init
+                int dsp_mode = (target_channels == 2) ? 0x30 : 0x10; 
+                write_dsp(dsp_cmd); write_dsp(dsp_mode); write_dsp((unsigned char)(block_size & 0xFF)); write_dsp((unsigned char)((block_size >> 8) & 0xFF));
+            } else {
+                unsigned int block_size = (active_buffer_size / 2) - 1; 
+                int dsp_cmd = 0xC6; // FORCE 8-BIT AUTO-INIT!
+                int dsp_mode = (target_channels == 2) ? 0x20 : 0x00; // Stereo/Mono Unsigned
+                write_dsp(dsp_cmd); write_dsp(dsp_mode); write_dsp((unsigned char)(block_size & 0xFF)); write_dsp((unsigned char)((block_size >> 8) & 0xFF));
+            }
         } else {
             if (dsp_major == 3) {
-                // Flip SB Pro hardware stereo bits
                 outportb(MIXER_ADDR, 0x0E);
                 unsigned char val = inportb(MIXER_DATA);
                 outportb(MIXER_ADDR, 0x0E);
                 outportb(MIXER_DATA, (target_channels == 2) ? (val | 0x02) : (val & ~0x02));
             }
             
-            // Calculate the physical byte output rate (Stereo sends 2 bytes per sample)
-            // 1. Keep your original stereo logic exactly as it is!
             int output_rate = (target_channels == 2) ? target_sample_rate * 2 : target_sample_rate;
-            
-            // 2. NEW: Add rounding to the Time Constant to prevent emulator overshoot!
             int tc = 256 - ((1000000 + (output_rate / 2)) / output_rate);
-            
-            // 3. NEW: Reverse the math to find the ACTUAL rate the hardware will use
             int actual_output_rate = 1000000 / (256 - tc);
-            
-            // 4. NEW: Divide it back down if it's stereo to find the true per-channel rate, 
-            // and feed that back to your software resampler!
             target_sample_rate = (target_channels == 2) ? (actual_output_rate / 2) : actual_output_rate;
 
-            // 5. Send to DSP
             write_dsp(0x40); 
             write_dsp((unsigned char)tc);
             
-            unsigned int block_size = (active_buffer_size / 2) - 1; // 8-bit block format
+            unsigned int block_size = (active_buffer_size / 2) - 1; 
             
             if (!has_auto_init) {
-                // DSP 1.x and DSP 2.00: Single-cycle.
                 if (output_rate > 21739) {
                     write_dsp(0x48); write_dsp((unsigned char)(block_size & 0xFF)); write_dsp((unsigned char)((block_size >> 8) & 0xFF));
-                    write_dsp(0x91); // High-speed single-cycle
+                    write_dsp(0x91); 
                 } else {
                     write_dsp(0x14); write_dsp((unsigned char)(block_size & 0xFF)); write_dsp((unsigned char)((block_size >> 8) & 0xFF));
                 }
             } else {
-                // DSP 2.01+ and 3.xx
                 write_dsp(0x48); write_dsp((unsigned char)(block_size & 0xFF)); write_dsp((unsigned char)((block_size >> 8) & 0xFF));
-                if (output_rate > 23000) {
-                    write_dsp(0x90); // HIGH SPEED auto-init
-                } else {
-                    write_dsp(0x1C); // Normal speed auto-init
-                }
+                if (output_rate > 23000) write_dsp(0x90); else write_dsp(0x1C); 
             }
         }
     }
     return 0;
 }
 
-void close_audio_engine(){
+void close_audio_engine() {
     if (global_is_pc_speaker) {
         outportb(0x43, 0x36); 
         outportb(0x40, 0x00);
         outportb(0x40, 0x00);
         outportb(0x61, inportb(0x61) & ~0x03); 
-        _go32_dpmi_set_protected_mode_interrupt_vector(0x08, &old_isr);
+        
+        // BULLETPROOF: Only unhook if we actually hooked it!
+        if (old_isr.pm_offset != 0 || old_isr.pm_selector != 0) {
+            _go32_dpmi_set_protected_mode_interrupt_vector(0x08, &old_isr);
+        }
     } else { 
-        // 1. Force the Sound Blaster into a hard sleep state
         reset_dsp(); 
         
-        // 2. Tell the motherboard DMA controller to stop transferring bytes
-        outportb(DMA8_MASK, 0x05);  // Mask DMA Channel 1
-        outportb(DMA16_MASK, 0x05); // Mask DMA Channel 5
+        // Safely clear DMA masks without hardcoding channel 1/5!
+        outportb(0x0A, 0x04 | SB_DMA); 
+        if (SB_HDMA >= 4) outportb(0xD4, 0x04 | (SB_HDMA > 3 ? SB_HDMA - 4 : SB_HDMA));
 
-        // 3. Mask the IRQ in the PIC so the card stops throwing interrupts at DOS
         outportb(0x21, inportb(0x21) | (1 << SB_IRQ));
 
-        // 4. Safely unhook our interrupt vector and restore the DOS default
-        _go32_dpmi_set_protected_mode_interrupt_vector(IRQ_VECTOR, &old_isr); 
+        // BULLETPROOF: Only unhook if we actually hooked it!
+        if (old_isr.pm_offset != 0 || old_isr.pm_selector != 0) {
+            _go32_dpmi_set_protected_mode_interrupt_vector(IRQ_VECTOR, &old_isr); 
+        }
         
-        // 5. Free the hardware memory buffer
-        _go32_dpmi_free_dos_memory(&dos_buffer); 
+        // BULLETPROOF: Only free DOS memory if it was successfully allocated!
+        if (dos_buffer.rm_segment != 0) {
+            _go32_dpmi_free_dos_memory(&dos_buffer); 
+            dos_buffer.rm_segment = 0;
+        }
     }
 
-    _go32_dpmi_free_iret_wrapper(&new_isr);
+    // BULLETPROOF: Only free the wrapper if we hooked the interrupt!
+    if (old_isr.pm_offset != 0 || old_isr.pm_selector != 0) {
+        _go32_dpmi_free_iret_wrapper(&new_isr);
+        old_isr.pm_offset = 0; 
+        old_isr.pm_selector = 0;
+    }
     
-    // 6. Free our RAM and nullify pointers so the next load starts clean
     if (mp3_ram_cache) { free(mp3_ram_cache); mp3_ram_cache = NULL; }
     if (pcm_ram_cache) { free(pcm_ram_cache); pcm_ram_cache = NULL; }
 }
 
 int main(int argc, char* argv[]) {
     load_config(); 
+
+    char* blaster_env = getenv("BLASTER");
+    if (blaster_env) {
+        char* a_ptr = strstr(blaster_env, "A");
+        if (!a_ptr) a_ptr = strstr(blaster_env, "a");
+        if (a_ptr) sscanf(a_ptr + 1, "%x", &DSP_BASE);
+        
+        char* i_ptr = strstr(blaster_env, "I");
+        if (!i_ptr) i_ptr = strstr(blaster_env, "i");
+        if (i_ptr) {
+            sscanf(i_ptr + 1, "%d", &SB_IRQ);
+            // Safely map all 15 possible motherboard IRQs to the CPU
+            if (SB_IRQ < 8) IRQ_VECTOR = SB_IRQ + 8;
+            else IRQ_VECTOR = SB_IRQ + 104; 
+        }
+
+        char* d_ptr = strstr(blaster_env, "D");
+        if (!d_ptr) d_ptr = strstr(blaster_env, "d");
+        if (d_ptr) sscanf(d_ptr + 1, "%d", &SB_DMA);
+
+        char* h_ptr = strstr(blaster_env, "H");
+        if (!h_ptr) h_ptr = strstr(blaster_env, "h");
+        if (h_ptr) sscanf(h_ptr + 1, "%d", &SB_HDMA);
+    }
 
     union REGS regs;
     regs.h.ah = 0x0F; // BIOS Get Video Mode
@@ -3348,15 +3664,30 @@ int main(int argc, char* argv[]) {
     
     if (global_is_pc_speaker) {
         target_channels = 1; active_bitdepth = 8; active_buffer_size = custom_buffer_size > 0 ? custom_buffer_size : 8192; 
-        target_sample_rate = custom_sample_rate > 0 ? custom_sample_rate : 22050; pit_divisor = 1193180 / target_sample_rate;
+        
+        // --- 22kHz CARRIER FIX ---
+        // Strip out the 11kHz 486-hardcode so the carrier stays purely ultrasonic!
+        target_sample_rate = custom_sample_rate > 0 ? custom_sample_rate : 22050; 
+        pit_divisor = 1193180 / target_sample_rate;
     } else {
-        active_bitdepth = is_sb16 ? 16 : 8; active_buffer_size = custom_buffer_size > 0 ? custom_buffer_size : (is_sb16 ? 65536 : 32768); 
-        if (global_is_486 && !file_is_native_wav){ 
+        active_bitdepth = is_sb16 ? 16 : 8; 
+
+        // 16-BIT TEST: Bypassing the H3 8-bit downgrade!
+        // if (is_sb16 && SB_HDMA < 4) active_bitdepth = 8; 
+
+        active_buffer_size = custom_buffer_size > 0 ? custom_buffer_size : ((active_bitdepth == 16) ? 65536 : 32768);
+
+        if (global_is_486 && custom_sample_rate == 0) {
+            target_sample_rate = 22050; // Cap at 22k to prevent UI freezing!
+        } else if (global_is_486 && !file_is_native_wav) { 
             target_sample_rate = current_sample_rate / CONF_486_DIVISOR; 
             target_channels = CONF_486_CHANNELS; 
             if (custom_sample_rate > 0) target_sample_rate = custom_sample_rate; 
-        } 
-        else { if (custom_sample_rate > 0) target_sample_rate = custom_sample_rate; if (is_sb16 && target_sample_rate > 44100) target_sample_rate = 44100; }
+        } else { 
+            if (custom_sample_rate > 0) target_sample_rate = custom_sample_rate; 
+            if (is_sb16 && target_sample_rate > 44100) target_sample_rate = 44100; 
+        }
+        // ---------------------------------------
         if (!is_sb16) {
             if (!has_auto_init) { target_channels = 1; if (target_sample_rate > 21739) target_sample_rate = 21739; } 
             else if (dsp_major == 2 && has_auto_init) { target_channels = 1; if (target_sample_rate > 44100) target_sample_rate = 44100; } 
@@ -3371,12 +3702,20 @@ int main(int argc, char* argv[]) {
         FILE *mp3_file = fopen(app_filename, "rb"); if (!mp3_file) return 1;
         fseek(mp3_file, 0, SEEK_END); file_size = ftell(mp3_file); if (start_off > file_size) start_off = 0;
         
-        if (global_is_486 && !file_is_native_wav) { // <-- 1. BYPASS IF WAV!
+        // Force High-Res WAVs to generate an offline cache file ONLY if PC Speaker is active!
+        int needs_wav_downsample = file_is_native_wav && (current_sample_rate != target_sample_rate || current_channels != target_channels || current_bitdepth != active_bitdepth);
+        if (global_is_486 && (!file_is_native_wav || (global_is_pc_speaker && needs_wav_downsample))) { 
             int conversion_success = 0, active_divisor = CONF_486_DIVISOR;
             while (!conversion_success && active_divisor <= 4) {
                 if (!global_is_pc_speaker && custom_sample_rate == 0) { 
                     target_sample_rate = current_sample_rate / active_divisor; 
-                    if (is_sb16 && target_sample_rate > 44100) target_sample_rate = 44100; 
+                    
+                    // --- 486 SOUND BLASTER STABILITY FIX ---
+                    if (global_is_486) {
+                        if (target_sample_rate > 22050) target_sample_rate = 22050; // Cap at 22k for 486
+                    } else {
+                        if (is_sb16 && target_sample_rate > 44100) target_sample_rate = 44100; 
+                    }
                     
                     // --- APPLY SB PRO 1MHz HARDWARE LIMITS TO TRANSCODER ---
                     if (!is_sb16 && dsp_major == 3) {
@@ -3389,49 +3728,123 @@ int main(int argc, char* argv[]) {
                     
                     resample_step = ((unsigned long long)current_sample_rate << 16) / target_sample_rate; 
                 }
-                printf("\n[ 486 OPTIMIZATION: Transcoding MP3 to WAV (1/%d Quality) ]\nProcessing... ", active_divisor);
+                if (file_is_native_wav) {
+                    printf("\n[ 486 OPTIMIZATION: Downsampling WAV to WAV (1/%d Quality) ]\nProcessing... ", active_divisor);
+                } else {
+                    printf("\n[ 486 OPTIMIZATION: Transcoding MP3 to WAV (1/%d Quality) ]\nProcessing... ", active_divisor);
+                }
                 FILE *wav_file = fopen("486_temp.wav", "wb+");
                 if (wav_file) {
                     unsigned char dummy_header[44] = {0}; fwrite(dummy_header, 1, 44, wav_file);
                     mp3dec_t temp_mp3d; mp3dec_init(&temp_mp3d); mp3dec_frame_info_t temp_info; 
                     
                     active_audio_file = mp3_file; fseek(active_audio_file, start_off, SEEK_SET);
-                    stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); current_ram_ptr = stream_buffer;
+                    stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); current_ram_ptr = stream_buffer;
                     long trans_bytes_left = file_size - start_off; int total_wav_bytes = 0, disk_full = 0;
+                    
+                    // --- PROGRESS BAR GLOBALS ---
+                    long total_transcode_bytes = trans_bytes_left; if (total_transcode_bytes <= 0) total_transcode_bytes = 1;
+                    int last_drawn_percent = -1;
+                    // ----------------------------
                     
                     while (trans_bytes_left > 0) {
                         refill_stream(); int avail = stream_bytes - (current_ram_ptr - stream_buffer);
-                        int samples = mp3dec_decode_frame(&temp_mp3d, current_ram_ptr, avail, pcm_temp, &temp_info);
+                        int samples = 0;
+                        if (!file_is_native_wav) {
+                            samples = mp3dec_decode_frame(&temp_mp3d, current_ram_ptr, avail, pcm_temp, &temp_info);
+                        } else {
+                            // --- NATIVE WAV OFFLINE DOWNSAMPLER ---
+                            int bps = current_channels * (current_bitdepth / 8); if (bps == 0) bps = 1;
+                            int frames = (sizeof(pcm_temp) / 2) / current_channels; if (frames > 1152) frames = 1152;
+                            int bytes = frames * bps; if (bytes > avail) bytes = avail - (avail % bps);
+                            if (bytes > trans_bytes_left) bytes = trans_bytes_left - (trans_bytes_left % bps);
+                            if (bytes > 0) {
+                                if (current_bitdepth == 8) { unsigned char* w8 = (unsigned char*)current_ram_ptr; for (int i=0; i < (bytes/bps)*current_channels; i++) pcm_temp[i] = (w8[i] - 128) << 8; }
+                                else memcpy(pcm_temp, current_ram_ptr, bytes);
+                                current_ram_ptr += bytes; trans_bytes_left -= bytes; samples = bytes / bps;
+                            } else { trans_bytes_left = 0; }
+                        }
                         if (samples > 0) {
                             int out_samples = samples; short* final_pcm_ptr = pcm_temp;
                             if (current_sample_rate != target_sample_rate || current_channels != target_channels) {
-                                out_samples = 0; unsigned int temp_resample_pos = 0;
-                                while ((temp_resample_pos >> 16) < samples) {
-                                    int src_idx = temp_resample_pos >> 16; unsigned int frac = temp_resample_pos & 0xFFFF;
-                                    if (src_idx >= samples - 1) { if (target_channels == 2 && current_channels == 2) { resampled_temp[out_samples*2] = pcm_temp[src_idx*2]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx*2+1]; } else if (target_channels == 1 && current_channels == 2) { resampled_temp[out_samples] = (pcm_temp[src_idx*2] >> 1) + (pcm_temp[src_idx*2+1] >> 1); } else if (target_channels == 2 && current_channels == 1) { resampled_temp[out_samples*2] = pcm_temp[src_idx]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx]; } else resampled_temp[out_samples] = pcm_temp[src_idx]; } 
-                                    else { if (target_channels == 2 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; resampled_temp[out_samples*2] = L0 + (((L1 - L0) * (int)frac) >> 16); resampled_temp[out_samples*2+1] = R0 + (((R1 - R0) * (int)frac) >> 16); } else if (target_channels == 1 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; int M0=(L0>>1)+(R0>>1), M1=(L1>>1)+(R1>>1); resampled_temp[out_samples] = M0 + (((M1 - M0) * (int)frac) >> 16); } else if (target_channels == 2 && current_channels == 1) { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; int val = S0 + (((S1 - S0) * (int)frac) >> 16); resampled_temp[out_samples*2] = val; resampled_temp[out_samples*2+1] = val; } else { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; resampled_temp[out_samples] = S0 + (((S1 - S0) * (int)frac) >> 16); } } out_samples++; temp_resample_pos += resample_step;
-                                } final_pcm_ptr = resampled_temp;
+                                // --- FAST-PATH DOWNSAMPLERS FOR OFFLINE CACHE GENERATION ---
+                                if (global_is_pc_speaker) {
+                                    out_samples = 0; unsigned int temp_resample_pos = 0;
+                                    while ((temp_resample_pos >> 16) < samples) {
+                                        int src_idx = temp_resample_pos >> 16;
+                                        if (current_channels == 2) resampled_temp[out_samples++] = (pcm_temp[src_idx*2] >> 1) + (pcm_temp[src_idx*2+1] >> 1);
+                                        else resampled_temp[out_samples++] = pcm_temp[src_idx];
+                                        temp_resample_pos += resample_step;
+                                    }
+                                    final_pcm_ptr = resampled_temp;
+                                } else if (global_is_486 && current_channels == 2 && target_channels == 1 && resample_step == 131072) {
+                                    out_samples = 0;
+                                    for (int i = 0; i < samples; i += 2) {
+                                        resampled_temp[out_samples++] = (pcm_temp[i*2] >> 1) + (pcm_temp[i*2+1] >> 1);
+                                    }
+                                    final_pcm_ptr = resampled_temp;
+                                } else {
+                                    out_samples = 0; unsigned int temp_resample_pos = 0;
+                                    while ((temp_resample_pos >> 16) < samples) {
+                                        int src_idx = temp_resample_pos >> 16; unsigned int frac = temp_resample_pos & 0xFFFF;
+                                        if (src_idx >= samples - 1) { if (target_channels == 2 && current_channels == 2) { resampled_temp[out_samples*2] = pcm_temp[src_idx*2]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx*2+1]; } else if (target_channels == 1 && current_channels == 2) { resampled_temp[out_samples] = (pcm_temp[src_idx*2] >> 1) + (pcm_temp[src_idx*2+1] >> 1); } else if (target_channels == 2 && current_channels == 1) { resampled_temp[out_samples*2] = pcm_temp[src_idx]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx]; } else resampled_temp[out_samples] = pcm_temp[src_idx]; } 
+                                        else { if (target_channels == 2 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; resampled_temp[out_samples*2] = L0 + (((L1 - L0) * (int)frac) >> 16); resampled_temp[out_samples*2+1] = R0 + (((R1 - R0) * (int)frac) >> 16); } else if (target_channels == 1 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; int M0=(L0>>1)+(R0>>1), M1=(L1>>1)+(R1>>1); resampled_temp[out_samples] = M0 + (((M1 - M0) * (int)frac) >> 16); } else if (target_channels == 2 && current_channels == 1) { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; int val = S0 + (((S1 - S0) * (int)frac) >> 16); resampled_temp[out_samples*2] = val; resampled_temp[out_samples*2+1] = val; } else { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; resampled_temp[out_samples] = S0 + (((S1 - S0) * (int)frac) >> 16); } } out_samples++; temp_resample_pos += resample_step;
+                                    } final_pcm_ptr = resampled_temp;
+                                }
                             }
                             int final_total_samples = out_samples * target_channels; int expected_bytes = 0, written_bytes = 0;
                             if (active_bitdepth == 8) { unsigned char out_8bit[MINIMP3_MAX_SAMPLES_PER_FRAME * 2]; for (int i = 0; i < final_total_samples; i++) out_8bit[i] = (unsigned char)((final_pcm_ptr[i] >> 8) + 128); expected_bytes = final_total_samples; written_bytes = fwrite(out_8bit, 1, expected_bytes, wav_file); } else { expected_bytes = final_total_samples * 2; written_bytes = fwrite(final_pcm_ptr, 1, expected_bytes, wav_file); }
                             if (written_bytes != expected_bytes) { disk_full = 1; break; } total_wav_bytes += written_bytes;
                         }
                         if (disk_full) break;
-                        if (temp_info.frame_bytes > 0) { current_ram_ptr += temp_info.frame_bytes; trans_bytes_left -= temp_info.frame_bytes; } else { current_ram_ptr++; trans_bytes_left--; }
+                        if (!file_is_native_wav) {
+                            if (temp_info.frame_bytes > 0) { current_ram_ptr += temp_info.frame_bytes; trans_bytes_left -= temp_info.frame_bytes; } else { current_ram_ptr++; trans_bytes_left--; }
+                        }
+                        
+                        // --- PROGRESS BAR UPDATE ---
+                        int percent = 100 - ((trans_bytes_left * 100) / total_transcode_bytes);
+                        if (percent < 0) percent = 0; if (percent > 100) percent = 100;
+                        if (percent != last_drawn_percent) {
+                            printf("\rProcessing... %3d%%", percent);
+                            fflush(stdout);
+                            last_drawn_percent = percent;
+                        }
+                        // ---------------------------
                     }
+                    printf("\n");
+                    
                     if (disk_full) { fclose(wav_file); remove("486_temp.wav"); active_divisor++; continue; }
                     rewind(wav_file); write_wav_header(wav_file, target_sample_rate, target_channels, active_bitdepth, total_wav_bytes);
                     global_wav_bytes = total_wav_bytes; ui_total_seconds = total_wav_bytes / (target_sample_rate * target_channels * (active_bitdepth / 8)); conversion_success = 1;
-                    fclose(mp3_file); active_audio_file = wav_file; fseek(active_audio_file, 44, SEEK_SET);
-                } else return 1;
+                    fclose(mp3_file); 
+                    active_audio_file = wav_file; 
+                    
+                    // --- THE FAST-FORWARD FIX ---
+                    file_is_native_wav = 1;
+                    current_sample_rate = target_sample_rate;
+                    current_channels = target_channels;
+                    current_bitdepth = active_bitdepth;
+                    start_off = 44;
+                    wav_data_size = total_wav_bytes;
+                    resample_step = 65536;
+                    // ----------------------------
+                    
+                    fseek(active_audio_file, start_off, SEEK_SET);
+                } 
+                else return 1;
                 if (global_is_pc_speaker || custom_sample_rate > 0) break;
             }
             if (!conversion_success) { if(active_audio_file) fclose(active_audio_file); return 1; }
         } 
-        else {
+        else{
+            if (global_is_486 && file_is_native_wav) {
+                printf("\n[ 486 OPTIMIZATION: File is already WAV. Bypassing transcoder! ]\n");
+                delay(1000);
+            }
+            
             active_audio_file = mp3_file; 
             fseek(active_audio_file, start_off, SEEK_SET);
-            stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); 
+            stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); 
             current_ram_ptr = stream_buffer;
             
             if (!file_is_native_wav) { // <-- 2. PROTECT THE MP3 METADATA PARSER!
@@ -3452,6 +3865,19 @@ int main(int argc, char* argv[]) {
     if (has_active_file) { 
         //printf("\nPress ANY KEY to launch Player UI...\n"); 
     }
+    
+    // --- 486 DIRECT PLAY OPTIMIZATION ---
+    if (global_is_486 && file_is_native_wav) {
+        if (!global_is_pc_speaker) {
+            target_sample_rate = current_sample_rate;
+            target_channels = current_channels;
+            if (is_sb16) active_bitdepth = current_bitdepth;
+        }
+        
+        // --- THE 0.37s SKIP FIX ---
+        fseek(active_audio_file, start_off, SEEK_SET); 
+    }
+
     if(init_audio_engine()) return 1;
 
     int keep_playing = 1, pcm_leftover_offset = 0, prev_mouse_left = 0, prev_mouse_right = 0;
@@ -3459,6 +3885,7 @@ int main(int argc, char* argv[]) {
     clock_t last_file_click_time = 0; 
     int last_clicked_file_idx = -1; 
     int advance_playlist = 0;
+    show_mouse();
 
     while (keep_playing) {// Main Playback Loop
         if (advance_playlist) {
@@ -3476,6 +3903,20 @@ int main(int argc, char* argv[]) {
                 ui_total_seconds = 0;
                 ui_total_samples_played = 0;
                 is_paused = 1; // Pause the engine to save CPU
+                
+                // --- THE "JUST STOPS" UI FIX ---
+                // We must explicitly wipe the ID3 metadata buffers!
+                // Otherwise, the UI redraws the old song name, making the 
+                // program look completely frozen instead of returning to "No File"!
+                has_id3 = 0;
+                file_is_native_wav = 0;
+                memset(id3_title, 0, 31); memset(id3_artist, 0, 31);
+                memset(id3_album, 0, 31); memset(id3_year, 0, 5); memset(id3_label, 0, 31);
+                memset(id3_album_artist, 0, 31); memset(id3_track, 0, 10); memset(id3_genre, 0, 31);
+                memset(id3_composer, 0, 31); memset(id3_copyright, 0, 31); memset(id3_encoded_by, 0, 31);
+                memset(id3_bpm, 0, 10); memset(id3_key, 0, 10); 
+                memset(id3_remix, 0, 31); memset(id3_subtitle, 0, 31);
+                // -------------------------------
                 
                 if (has_mouse) hide_mouse();
                 clear_inner_ui();
@@ -3504,15 +3945,19 @@ int main(int argc, char* argv[]) {
 
             while (fill_idx < end_idx && keep_playing) {
                 if (is_paused || !has_active_file || !active_audio_file) {
-                    unsigned char zero[2048]; 
-                    memset(zero, (active_bitdepth == 8) ? 128 : 0, 2048); 
-                    int fill_len = end_idx - fill_idx; if (fill_len > 2048) fill_len = 2048;
-                    if (global_is_pc_speaker) memcpy(pc_speaker_dma + fill_idx, zero, fill_len); 
-                    else dosmemput(zero, fill_len, physical_addr + fill_idx); fill_idx += fill_len; 
-                    continue;
-                }
-                if (global_is_486) {
-                    int bytes_to_copy = end_idx - fill_idx;
+                unsigned char zero[2048]; 
+                memset(zero, (active_bitdepth == 8) ? 128 : 0, 2048); 
+                int fill_len = end_idx - fill_idx; if (fill_len > 2048) fill_len = 2048;
+                if (global_is_pc_speaker) memcpy(pc_speaker_dma + fill_idx, zero, fill_len); 
+                else dosmemput(zero, fill_len, physical_addr + fill_idx); fill_idx += fill_len; 
+                continue;
+            }
+            
+            // --- THE PROTECTION SYSTEM ---
+            // Prevent the PC Speaker from blindly streaming 16-bit Stereo data!
+            // This forces it into the resampler block so it mathematically downmixes!
+            if (global_is_486 && !global_is_pc_speaker) {
+                int bytes_to_copy = end_idx - fill_idx;
                     if (bytes_to_copy > 0) {
                         // --- FIX: READ INTO THE MASSIVE 64KB STREAM BUFFER, NOT PCM_TEMP! ---
                         int read_bytes = fread(stream_buffer, 1, bytes_to_copy, active_audio_file);
@@ -3528,35 +3973,39 @@ int main(int argc, char* argv[]) {
                     }
                 } 
                 else {
-                    if (pcm_leftover_bytes > 0) { int copy = pcm_leftover_bytes; if (fill_idx + copy > end_idx) copy = end_idx - fill_idx; if (global_is_pc_speaker) memcpy(pc_speaker_dma + fill_idx, (unsigned char*)pcm_temp + pcm_leftover_offset, copy); else dosmemput((unsigned char*)pcm_temp + pcm_leftover_offset, copy, physical_addr + fill_idx); fill_idx += copy; pcm_leftover_offset += copy; pcm_leftover_bytes -= copy; } 
+                    if (pcm_leftover_bytes > 0) { int copy = pcm_leftover_bytes; if (fill_idx + copy > end_idx) copy = end_idx - fill_idx; if (global_is_pc_speaker) memcpy(pc_speaker_dma + fill_idx, pcm_leftover_buffer + pcm_leftover_offset, copy); else dosmemput(pcm_leftover_buffer + pcm_leftover_offset, copy, physical_addr + fill_idx); fill_idx += copy; pcm_leftover_offset += copy; pcm_leftover_bytes -= copy; }
                     else {
-                        refill_stream(); int avail = stream_bytes - (current_ram_ptr - stream_buffer);
+                        // --- UNIFIED MACRO-CHUNKING PIPELINE ---
+                        refill_stream(); 
+                        int avail = stream_bytes - (current_ram_ptr - stream_buffer);
                         
-                        // --- FIX: EOF INFINITE LOOP AVOIDANCE ---
+                        // EOF / Looping Catch
                         int min_bytes = file_is_native_wav ? (current_channels * (current_bitdepth / 8)) : 1;
                         if (avail < min_bytes && feof(active_audio_file)) { 
-                            if (is_looping) { fseek(active_audio_file, start_off, SEEK_SET); stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); current_ram_ptr = stream_buffer; resample_pos = 0; ui_total_samples_played = 0; continue; } 
-                            else { advance_playlist = 1; break; } 
+                            if (is_looping) { 
+                                fseek(active_audio_file, start_off, SEEK_SET); 
+                                stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); 
+                                current_ram_ptr = stream_buffer; resample_pos = 0; ui_total_samples_played = 0; 
+                                continue; 
+                            } else { advance_playlist = 1; break; } 
                         }
-                        // ----------------------------------------
                         
-                        // --- NEW: DUAL MP3 / NATIVE WAV REAL-TIME STREAMING! ---
                         int samples = 0;
                         if (file_is_native_wav) {
                             int bytes_per_sample = current_channels * (current_bitdepth / 8);
-                            int frames_to_read = 1152;
+                            if (bytes_per_sample == 0) bytes_per_sample = 1; 
+                            
+                            int frames_to_read = (sizeof(pcm_temp) / 2) / current_channels;
+                            if (frames_to_read > 1152) frames_to_read = 1152; 
                             int bytes_to_read = frames_to_read * bytes_per_sample;
                             if (bytes_to_read > avail) bytes_to_read = avail - (avail % bytes_per_sample);
                             
                             if (bytes_to_read > 0) {
                                 if (current_bitdepth == 8) {
                                     unsigned char* wav8 = (unsigned char*)current_ram_ptr;
-                                    for (int i=0; i < (bytes_to_read / bytes_per_sample) * current_channels; i++) {
-                                        pcm_temp[i] = (wav8[i] - 128) << 8;
-                                    }
-                                } else {
-                                    memcpy(pcm_temp, current_ram_ptr, bytes_to_read);
-                                }
+                                    for (int i=0; i < (bytes_to_read / bytes_per_sample) * current_channels; i++) pcm_temp[i] = (wav8[i] - 128) << 8;
+                                } else memcpy(pcm_temp, current_ram_ptr, bytes_to_read);
+                                
                                 current_ram_ptr += bytes_to_read;
                                 samples = bytes_to_read / bytes_per_sample;
                             }
@@ -3564,13 +4013,34 @@ int main(int argc, char* argv[]) {
                             samples = mp3dec_decode_frame(&mp3d, current_ram_ptr, avail, pcm_temp, &info);
                             if (info.frame_bytes > 0) current_ram_ptr += info.frame_bytes; else current_ram_ptr++;
                         }
-                        // -------------------------------------------------------
 
                         if (samples > 0) {
                             frames_decoded++; int out_samples = samples; short* final_pcm_ptr = pcm_temp;
-                            if (current_sample_rate != target_sample_rate || current_channels != target_channels) { out_samples = 0; while ((resample_pos >> 16) < samples) { int src_idx = resample_pos >> 16; unsigned int frac = resample_pos & 0xFFFF; if (src_idx >= samples - 1) { if (target_channels == 2 && current_channels == 2) { resampled_temp[out_samples*2] = pcm_temp[src_idx*2]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx*2+1]; } else if (target_channels == 1 && current_channels == 2) { resampled_temp[out_samples] = (pcm_temp[src_idx*2] >> 1) + (pcm_temp[src_idx*2+1] >> 1); } else if (target_channels == 2 && current_channels == 1) { resampled_temp[out_samples*2] = pcm_temp[src_idx]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx]; } else { resampled_temp[out_samples] = pcm_temp[src_idx]; } } else { if (target_channels == 2 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; resampled_temp[out_samples*2] = L0 + (((L1 - L0) * (int)frac) >> 16); resampled_temp[out_samples*2+1] = R0 + (((R1 - R0) * (int)frac) >> 16); } else if (target_channels == 1 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; int M0=(L0>>1)+(R0>>1), M1=(L1>>1)+(R1>>1); resampled_temp[out_samples] = M0 + (((M1 - M0) * (int)frac) >> 16); } else if (target_channels == 2 && current_channels == 1) { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; int val = S0 + (((S1 - S0) * (int)frac) >> 16); resampled_temp[out_samples*2] = val; resampled_temp[out_samples*2+1] = val; } else { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; resampled_temp[out_samples] = S0 + (((S1 - S0) * (int)frac) >> 16); } } out_samples++; resample_pos += resample_step; } resample_pos -= (samples << 16); final_pcm_ptr = resampled_temp; }
+                            if (current_sample_rate != target_sample_rate || current_channels != target_channels) { 
+                                // --- FAST PATH DOWNMIXER FOR 486 ---
+                                // Instantly skip the heavy fractional math if doing a perfect 2:1 drop!
+                                if (global_is_486 && current_channels == 2 && target_channels == 1 && resample_step == 131072) {
+                                    out_samples = 0;
+                                    for (int i = 0; i < samples; i += 2) {
+                                        resampled_temp[out_samples++] = (pcm_temp[i*2] >> 1) + (pcm_temp[i*2+1] >> 1);
+                                    }
+                                    resample_pos = 0; // Lock to 0 to prevent drift
+                                    final_pcm_ptr = resampled_temp;
+                                } else {
+                                    out_samples = 0; while ((resample_pos >> 16) < samples) { int src_idx = resample_pos >> 16; unsigned int frac = resample_pos & 0xFFFF; if (src_idx >= samples - 1) { if (target_channels == 2 && current_channels == 2) { resampled_temp[out_samples*2] = pcm_temp[src_idx*2]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx*2+1]; } else if (target_channels == 1 && current_channels == 2) { resampled_temp[out_samples] = (pcm_temp[src_idx*2] >> 1) + (pcm_temp[src_idx*2+1] >> 1); } else if (target_channels == 2 && current_channels == 1) { resampled_temp[out_samples*2] = pcm_temp[src_idx]; resampled_temp[out_samples*2+1] = pcm_temp[src_idx]; } else { resampled_temp[out_samples] = pcm_temp[src_idx]; } } else { if (target_channels == 2 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; resampled_temp[out_samples*2] = L0 + (((L1 - L0) * (int)frac) >> 16); resampled_temp[out_samples*2+1] = R0 + (((R1 - R0) * (int)frac) >> 16); } else if (target_channels == 1 && current_channels == 2) { int L0=pcm_temp[src_idx*2], L1=pcm_temp[src_idx*2+2], R0=pcm_temp[src_idx*2+1], R1=pcm_temp[src_idx*2+3]; int M0=(L0>>1)+(R0>>1), M1=(L1>>1)+(R1>>1); resampled_temp[out_samples] = M0 + (((M1 - M0) * (int)frac) >> 16); } else if (target_channels == 2 && current_channels == 1) { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; int val = S0 + (((S1 - S0) * (int)frac) >> 16); resampled_temp[out_samples*2] = val; resampled_temp[out_samples*2+1] = val; } else { int S0=pcm_temp[src_idx], S1=pcm_temp[src_idx+1]; resampled_temp[out_samples] = S0 + (((S1 - S0) * (int)frac) >> 16); } } out_samples++; resample_pos += resample_step; } resample_pos -= (samples << 16); final_pcm_ptr = resampled_temp; 
+                                }
+                            }
                             if (out_samples > 0) { if (visualizer_mode == 2 && ui_view == 0) { long sum_l = 0, sum_r = 0; int count = 0; for (int i = 0; i < out_samples; i += 4) { sum_l += abs(final_pcm_ptr[i * target_channels]); if (target_channels == 2) sum_r += abs(final_pcm_ptr[i * target_channels + 1]); count++; } if (count > 0) { long l = ((sum_l / count) * 5) / 2; l *= VISUALIZER_GLOBAL_BOOST; if (l > 32767) l = 32767; if (l > next_vu_left_peak) next_vu_left_peak = l; if (target_channels == 2) { long r = ((sum_r / count) * 5) / 2; r *= VISUALIZER_GLOBAL_BOOST; if (active_bitdepth == 8) r *= 256; if (r > 32767) r = 32767; if (r > next_vu_right_peak) next_vu_right_peak = r; } else next_vu_right_peak = next_vu_left_peak; } } else if (visualizer_mode == 1 && ui_view == 0) { int freqs[NUM_BANDS] = {73, 110, 176, 294, 441, 735, 1102, 2205, 4410, 8820}; int boosts[NUM_BANDS] = {1, 2, 2, 3, 4, 5, 7, 10, 15, 22}; int max_limit = out_samples; if (max_limit > 1024) max_limit = 1024; for (int b = 0; b < NUM_BANDS; b++) { long real_part = 0, imag_part = 0; int p = target_sample_rate / freqs[b]; p = (p / 4) * 4; if (p < 4) p = 4; int hp = p / 2, qp = p / 4; int actual_limit = max_limit - (max_limit % p); if (actual_limit < p) actual_limit = p; int loop_count = actual_limit / 2; if (loop_count == 0) loop_count = 1; for (int i = 0; i < actual_limit; i += 2) { int val = final_pcm_ptr[i * target_channels]; int phase = i % p; if (phase < hp) real_part += val; else real_part -= val; int phase2 = (phase + qp) % p; if (phase2 < hp) imag_part += val; else imag_part -= val; } long amp = (abs(real_part) + abs(imag_part)) / loop_count; amp *= boosts[b]; amp *= VISUALIZER_GLOBAL_BOOST; if (amp > 32767) amp = 32767; if (amp > next_spectrum_peaks[b]) next_spectrum_peaks[b] = amp; } } }
-                            int final_total_samples = out_samples * target_channels; if (active_bitdepth == 8) { unsigned char* out_8bit = (unsigned char*)pcm_temp; for (int i = 0; i < final_total_samples; i++) out_8bit[i] = (unsigned char)((final_pcm_ptr[i] >> 8) + 128); pcm_leftover_bytes = final_total_samples; } else { if (final_pcm_ptr != pcm_temp) memcpy(pcm_temp, final_pcm_ptr, final_total_samples * 2); pcm_leftover_bytes = final_total_samples * 2; } pcm_leftover_offset = 0; ui_total_samples_played += out_samples; 
+                            int final_total_samples = out_samples * target_channels; 
+                            if (active_bitdepth == 8) { 
+                                for (int i = 0; i < final_total_samples; i++) 
+                                    pcm_leftover_buffer[i] = (unsigned char)((final_pcm_ptr[i] >> 8) + 128); 
+                                pcm_leftover_bytes = final_total_samples; 
+                            } else { 
+                                memcpy(pcm_leftover_buffer, final_pcm_ptr, final_total_samples * 2); 
+                                pcm_leftover_bytes = final_total_samples * 2; 
+                            } 
+                            pcm_leftover_offset = 0; ui_total_samples_played += out_samples;
                         }
                     }
                 } 
@@ -3589,6 +4059,40 @@ int main(int argc, char* argv[]) {
             int ext = 0; 
             if (c == 0 || c == 224) { 
                 ext = getch();
+                
+                // --- NEW ALT SHORTCUTS & MENU NAVIGATION ---
+                if (ext == 33 || ext == 30 || ext == 47) { // Alt+F, Alt+A, Alt+V
+                    int target_menu = (ext == 33) ? 1 : ((ext == 30) ? 2 : 3);
+                    if (has_mouse) hide_mouse();
+                    
+                    if (active_menu == target_menu) { 
+                        active_menu = 0; active_menu_hover = -1; // Toggle menu OFF
+                    } else { 
+                        active_menu = target_menu; active_menu_hover = 0; // Turn ON or SWITCH
+                    }
+                    
+                    // CRITICAL FIX: Physically wipe the screen to prevent ghost menus!
+                    force_ui_redraw = 1; browser_needs_redraw = 1; init_ui(app_filename); 
+                    if (has_mouse) show_mouse();
+                    
+                    c = 0; ext = 0;
+                }
+                else if (active_menu != 0) {
+                    if (ext == 72) { // Up Arrow
+                        if (active_menu_hover > 0) active_menu_hover--;
+                        else active_menu_hover = (active_menu == 1) ? 4 : ((active_menu == 2) ? 5 : 3); // Wrap around to bottom
+                        force_ui_redraw = 1;
+                    }
+                    else if (ext == 80) { // Down Arrow
+                        int max_hover = (active_menu == 1) ? 4 : ((active_menu == 2) ? 5 : 3);
+                        if (active_menu_hover < max_hover) active_menu_hover++;
+                        else active_menu_hover = 0; // Wrap around to top
+                        force_ui_redraw = 1;
+                    }
+                    c = 0; ext = 0; // Block background UI while menu is open!
+                }
+                // -------------------------------------------
+
                 if (active_menu == 0 && ui_view == 0) { if (ext == 72) c = '+'; else if (ext == 80) c = '-'; else if (ext == 77) c = 'f'; else if (ext == 75) c = 'b'; }
                 else if (ui_view == 1) {
                     if (active_input_field == 2) { 
@@ -3620,20 +4124,37 @@ int main(int argc, char* argv[]) {
             else if (ext == 75 && (_farpeekb(_dos_ds, 0x417) & 0x03)) { if (queue_count > 0 && queue_current > 0) { queue_current--; load_new_file_from_browser(queue_paths[queue_current]); } c = 0; ext = 0; }
             else if (ext == 77 && (_farpeekb(_dos_ds, 0x417) & 0x03)) { if (queue_count > 0 && queue_current < queue_count - 1) { queue_current++; load_new_file_from_browser(queue_paths[queue_current]); } c = 0; ext = 0; }
             else if (ext == 34) { if (has_active_file) is_paused = !is_paused; c = 0; ext = 0; }
-            else if (ext == 36) { if (has_active_file) { if (global_is_486) fseek(active_audio_file, 44, SEEK_SET); else { fseek(active_audio_file, start_off, SEEK_SET); stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); current_ram_ptr = stream_buffer; } ui_total_samples_played = 0; is_paused = 1; resample_pos = 0; pcm_leftover_bytes = 0; } c = 0; ext = 0; }
+            else if (ext == 36) { if (has_active_file) { if (global_is_486) fseek(active_audio_file, 44, SEEK_SET); else { fseek(active_audio_file, start_off, SEEK_SET); stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); current_ram_ptr = stream_buffer; } ui_total_samples_played = 0; is_paused = 1; resample_pos = 0; pcm_leftover_bytes = 0; } c = 0; ext = 0; }
             else if (ext == 16) { if (queue_count > 0 && queue_current > 0) { queue_current--; load_new_file_from_browser(queue_paths[queue_current]); } c = 0; ext = 0; }
             else if (ext == 25) { if (queue_count > 0 && queue_current < queue_count - 1) { queue_current++; load_new_file_from_browser(queue_paths[queue_current]); } c = 0; ext = 0; }
             else if (ext == 46) { set_volume(master_volume - 5); c = 0; ext = 0; }
             else if (ext == 48) { set_volume(master_volume + 5); c = 0; ext = 0; }
 
-            if (active_menu != 0) { if (c == 27) { active_menu = 0; active_menu_hover = -1; if (has_mouse) hide_mouse(); force_ui_redraw = 1; browser_needs_redraw = 1; init_ui(app_filename); if (has_mouse) show_mouse(); } } 
+            if (active_menu != 0) { 
+                if (c == 27) { active_menu = 0; active_menu_hover = -1; if (has_mouse) hide_mouse(); force_ui_redraw = 1; browser_needs_redraw = 1; init_ui(app_filename); if (has_mouse) show_mouse(); } 
+                else if (c == 13 && active_menu_hover != -1) { 
+                    // Simulate a left-click to execute the hovered menu item natively!
+                    mouse_left = 1; prev_mouse_left = 0; 
+                }
+            } 
             else if (ui_view == 0 || ui_view == 3 || ui_view == 4) {
                 if (c == 27 || c == 'q' || c == 'Q') keep_playing = 0;
                 if (c == '+' || c == '=') { set_volume(master_volume + 5); } 
                 if (c == '-' || c == '_') { set_volume(master_volume - 5); } 
                 if (c == ' ') { if (has_active_file) { is_paused = !is_paused; } } 
                 if (c == 'l' || c == 'L') { if (has_active_file) { is_looping = !is_looping; } } 
-                if (c == 'x' || c == 'X') { if (has_active_file) { if (global_is_486) fseek(active_audio_file, 44, SEEK_SET); else { fseek(active_audio_file, start_off, SEEK_SET); stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); current_ram_ptr = stream_buffer; } ui_total_samples_played = 0; is_paused = 1; resample_pos = 0; pcm_leftover_bytes = 0; } } 
+                if (c == 'x' || c == 'X') { if (has_active_file) { if (global_is_486) fseek(active_audio_file, 44, SEEK_SET); else { fseek(active_audio_file, start_off, SEEK_SET); stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); current_ram_ptr = stream_buffer; } ui_total_samples_played = 0; is_paused = 1; resample_pos = 0; pcm_leftover_bytes = 0; } } 
+                
+                if (c == 'v' || c == 'V') { 
+                    if (ui_view == 0) {
+                        visualizer_mode++; 
+                        if (visualizer_mode > 3) visualizer_mode = 0; 
+                        if (has_mouse) hide_mouse(); 
+                        clear_inner_ui(); force_ui_redraw = 1; 
+                        if (has_mouse) show_mouse(); 
+                    }
+                }
+                
                 if (c == 'f' || c == 'F') {
                     if (has_active_file && active_audio_file) {
                         float pct = (float)(ui_current_sec + 5) / (float)ui_total_seconds;
@@ -3652,9 +4173,11 @@ int main(int argc, char* argv[]) {
                             }
                             
                             fseek(active_audio_file, start_off + target_byte, SEEK_SET); 
-                            stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); 
-                            current_ram_ptr = stream_buffer; 
-                            if (!file_is_native_wav) mp3dec_init(&mp3d); 
+                            if (!file_is_native_wav) {
+                                stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); 
+                                current_ram_ptr = stream_buffer; 
+                                mp3dec_init(&mp3d); 
+                            }
                         }
                         ui_total_samples_played = (unsigned long)((float)ui_total_seconds * target_sample_rate * pct);
                         resample_pos = 0; pcm_leftover_bytes = 0; force_ui_redraw = 1; 
@@ -3679,7 +4202,7 @@ int main(int argc, char* argv[]) {
                             }
                             
                             fseek(active_audio_file, start_off + target_byte, SEEK_SET); 
-                            stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); 
+                            stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); 
                             current_ram_ptr = stream_buffer; 
                             if (!file_is_native_wav) mp3dec_init(&mp3d); 
                         }
@@ -3826,7 +4349,7 @@ int main(int argc, char* argv[]) {
                                 target_byte -= (target_byte % bps); 
                             }
                             fseek(active_audio_file, start_off + target_byte, SEEK_SET); 
-                            stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); 
+                            stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); 
                             current_ram_ptr = stream_buffer; 
                             if (!file_is_native_wav) mp3dec_init(&mp3d); 
                         } 
@@ -3856,7 +4379,7 @@ int main(int argc, char* argv[]) {
                             if (global_is_486) fseek(active_audio_file, 44, SEEK_SET); 
                             else { 
                                 fseek(active_audio_file, start_off, SEEK_SET); 
-                                stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); 
+                                stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); 
                                 current_ram_ptr = stream_buffer; 
                             } 
                             ui_total_samples_played = 0; 
@@ -3876,7 +4399,7 @@ int main(int argc, char* argv[]) {
                                 long target_byte = (long)(track_len * pct); 
                                 if (file_is_native_wav) { int bps = current_channels * (current_bitdepth / 8); target_byte -= (target_byte % bps); }
                                 fseek(active_audio_file, start_off + target_byte, SEEK_SET); 
-                                stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); 
+                                stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); 
                                 current_ram_ptr = stream_buffer; 
                                 if (!file_is_native_wav) mp3dec_init(&mp3d); 
                             } 
@@ -3900,7 +4423,7 @@ int main(int argc, char* argv[]) {
                                 long target_byte = (long)(track_len * pct); 
                                 if (file_is_native_wav) { int bps = current_channels * (current_bitdepth / 8); target_byte -= (target_byte % bps); }
                                 fseek(active_audio_file, start_off + target_byte, SEEK_SET); 
-                                stream_bytes = fread(stream_buffer, 1, 65536, active_audio_file); 
+                                stream_bytes = safe_disk_read(stream_buffer, 1, STREAM_BUFFER_SIZE, active_audio_file); 
                                 current_ram_ptr = stream_buffer; 
                                 if (!file_is_native_wav) mp3dec_init(&mp3d); 
                             } 
@@ -4055,7 +4578,10 @@ int main(int argc, char* argv[]) {
                         } 
                     }
                     else if (mouse_y == 22 && mouse_x >= 63 && mouse_x <= 76) { save_config(); settings_saved_flag = 1; browser_needs_redraw = 1; }
-                    if (setting_changed) { browser_needs_redraw = 1; }
+                    if (setting_changed) { 
+                        browser_needs_redraw = 1; 
+                        if (global_is_pc_speaker) build_speaker_lut(); // Update math if overdrive changed!
+                    }
                 }
                 else if (current_settings_tab == 4) {
                     int setting_changed = 0;
