@@ -128,7 +128,7 @@ Using native .wav files, or using the internal Transcoder Cache to pre-convert M
 
  - RAM: 4 MB
 
- - Audio: Motherboard PC Speaker (PWM Overdrive Mode) or Sound Blaster Pro 2.0
+ - Audio: Sound Blaster Pro 2.0
 
  - Video: VGA or MDA (Monochrome Display Adapter)
    
