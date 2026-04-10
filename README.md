@@ -109,7 +109,7 @@ For flawless 44.1kHz stereo MP3 decoding while running the FFT visualizer and VR
 
  - OS: MS-DOS 5.0+, FreeDOS, or modern emulators (DOSBox, DOSBox-X, PCem)
 
- - CPU: Intel Pentium 90 MHz or faster (or equivalent AMD/Cyrix)
+ - CPU: Intel Pentium 1 90 MHz or faster (or equivalent AMD/Cyrix)
 
  - RAM: 8 MB
 
@@ -122,19 +122,29 @@ For flawless 44.1kHz stereo MP3 decoding while running the FFT visualizer and VR
 Absolute Minimum (WAV / 486 Transcoder Mode)
 Using native .wav files, or using the internal Transcoder Cache to pre-convert MP3s before playback:
 
- - OS: MS-DOS 5.0+ with a DPMI host (CWSDPMI, HDPMI32i)
+ - OS: MS-DOS 5.0+ with a DPMI host (CWSDPMI)
 
- - CPU: Intel 80486 DX2-66 (A math coprocessor is highly recommended)
+ - CPU: Intel 80486 DX2-66 (A math coprocessor is highly recommended) (use -486 flag at command line to get proper playback)
 
- - RAM: 4 MB
+ - RAM: 7 MB
 
- - Audio: Sound Blaster Pro 2.0
+ - Audio: PC Speaker  (use -speaker flag at command line for that)
 
  - Video: VGA or MDA (Monochrome Display Adapter)
    
- - Input: Standard Keyboard and Microsoft Compatible Mouse (Serial or PS/2) [Mouse is required for changing settings]
+ - Input: Standard Keyboard [Mouse is required for changing settings, otherwise, use config.txt to edit settings]
 
 # Tested on
+[version 2.0]
+
+DOS 6.22 on Real Hardware with SB16 (Intel i486, 16MB Ram, 2GB CF Card Storage)
+
+DOS 6.22 on Real Hardware with sbemu (SB16) driver (AMD Ryzen 3200g)
+
+DOS version 7.10 on DOSBox-X (Various CPUs, 16MB Ram)
+
+[version 1.0]
+
 DOS version 7.10 on DOSBox-X version 2025.12.01
 
-DOS 6.22 on Real Hardware with sbemu driver (AMD Ryzen 3200g)
+DOS 6.22 on Real Hardware with sbemu (SB16) driver (AMD Ryzen 3200g)
