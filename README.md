@@ -1,9 +1,6 @@
 # Dos-Music-Player
 Dos-music-player is an audio/music player inspired by MPX Play and Windows Media Player, built entirely from scratch in C++, compiled with DJGPP, and with the help of Google Gemini for classic MS-DOS environments. It brings a modern, Windows-like GUI experience into a pure 80x25 text-mode terminal. Yes, I know that the whole program is made with the help of AI. Because I'm not good at coding at this level, I only know how to design the user interface, and I love a DOS and retro-futuristic aesthetic.
 
-## Minimum System Requirements
-
-
 Main Screen with debug visualizer, running under DOSBox
 
 ![Main Screen, running under DOSBox](screenshots/Main_view_with_visualizer_1.png)
@@ -119,8 +116,9 @@ For flawless 44.1kHz stereo MP3 decoding while running the FFT visualizer and VR
 
  - Input: Microsoft Compatible Mouse (Serial or PS/2) and Standard Keyboard
 
-Absolute Minimum (WAV / 486 Transcoder Mode)
-Using native .wav files, or using the internal Transcoder Cache to pre-convert MP3s before playback:
+## Absolute Minimum System Requirements
+Using 486 Transcoder Mode
+native .wav files, or using the internal Transcoder Cache to pre-convert MP3s before playback:
 
  - OS: MS-DOS 5.0+ with a DPMI host (CWSDPMI)
 
