@@ -3071,15 +3071,32 @@ void load_new_file_from_browser(const char* filepath) {
     
     has_active_file = 1; // Must be set BEFORE init so ID3 parsing triggers
     
-    // --- 486 DIRECT PLAY OPTIMIZATION ---
-    if (global_is_486 && file_is_native_wav) {
-        if (!global_is_pc_speaker) {
-            target_sample_rate = current_sample_rate;
-            target_channels = current_channels;
-            if (is_sb16) active_bitdepth = current_bitdepth;
-        }
+    // --- DYNAMIC DIRECT PLAY ROUTING ---
+    // Force the Sound Blaster hardware to natively match the WAV file's properties
+    if (file_is_native_wav && !global_is_pc_speaker && custom_sample_rate == 0) {
+        target_sample_rate = current_sample_rate;
         
-        // --- THE 0.37s SKIP FIX ---
+        // --- HARDWARE SAFETY CAPS ---
+        // Prevent high-res 48kHz+ files from passing the Direct Play check!
+        if (is_sb16 && target_sample_rate > 44100) target_sample_rate = 44100;
+        else if (!is_sb16 && target_sample_rate > 22050) target_sample_rate = 22050; 
+        // ----------------------------
+        
+        target_channels = current_channels;
+        if (is_sb16) active_bitdepth = current_bitdepth;
+    }
+    
+    // Evaluate the final pipeline state. If the hardware perfectly matches the WAV file,
+    // the main loop will bypass the 5MB RAM cache and stream directly from the disk.
+    int will_direct_play = file_is_native_wav && !global_is_pc_speaker && 
+                           (current_sample_rate == target_sample_rate) && 
+                           (current_channels == target_channels) && 
+                           (current_bitdepth == active_bitdepth);
+                           
+    if (will_direct_play) {
+        // Since we just loaded 5MB into the RAM cache during initialization, the physical
+        // file pointer is currently sitting at +5MB! 
+        // We MUST rewind it back to the start, otherwise Direct Play skips the first 30 seconds!
         fseek(active_audio_file, start_off, SEEK_SET); 
     }
     
@@ -3866,15 +3883,32 @@ int main(int argc, char* argv[]) {
         //printf("\nPress ANY KEY to launch Player UI...\n"); 
     }
     
-    // --- 486 DIRECT PLAY OPTIMIZATION ---
-    if (global_is_486 && file_is_native_wav) {
-        if (!global_is_pc_speaker) {
-            target_sample_rate = current_sample_rate;
-            target_channels = current_channels;
-            if (is_sb16) active_bitdepth = current_bitdepth;
-        }
+    // --- DYNAMIC DIRECT PLAY ROUTING ---
+    // Force the Sound Blaster hardware to natively match the WAV file's properties
+    if (file_is_native_wav && !global_is_pc_speaker && custom_sample_rate == 0) {
+        target_sample_rate = current_sample_rate;
         
-        // --- THE 0.37s SKIP FIX ---
+        // --- HARDWARE SAFETY CAPS ---
+        // Prevent high-res 48kHz+ files from passing the Direct Play check!
+        if (is_sb16 && target_sample_rate > 44100) target_sample_rate = 44100;
+        else if (!is_sb16 && target_sample_rate > 22050) target_sample_rate = 22050; 
+        // ----------------------------
+        
+        target_channels = current_channels;
+        if (is_sb16) active_bitdepth = current_bitdepth;
+    }
+    
+    // Evaluate the final pipeline state. If the hardware perfectly matches the WAV file,
+    // the main loop will bypass the 5MB RAM cache and stream directly from the disk.
+    int will_direct_play = file_is_native_wav && !global_is_pc_speaker && 
+                           (current_sample_rate == target_sample_rate) && 
+                           (current_channels == target_channels) && 
+                           (current_bitdepth == active_bitdepth);
+                           
+    if (will_direct_play) {
+        // Since we just loaded 5MB into the RAM cache during initialization, the physical
+        // file pointer is currently sitting at +5MB! 
+        // We MUST rewind it back to the start, otherwise Direct Play skips the first 30 seconds!
         fseek(active_audio_file, start_off, SEEK_SET); 
     }
 
@@ -3953,10 +3987,16 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             
-            // --- THE PROTECTION SYSTEM ---
-            // Prevent the PC Speaker from blindly streaming 16-bit Stereo data!
-            // This forces it into the resampler block so it mathematically downmixes!
-            if (global_is_486 && !global_is_pc_speaker) {
+            // --- THE DIRECT DMA PIPELINE ---
+            // If the file is a native WAV and perfectly matches the Sound Blaster's 
+            // hardware configuration, BYPASS the 5MB macro-chunking RAM buffer!
+            // Stream small chunks directly from the disk to the DMA buffer!
+            int can_direct_play = file_is_native_wav && !global_is_pc_speaker && 
+                                  (current_sample_rate == target_sample_rate) && 
+                                  (current_channels == target_channels) && 
+                                  (current_bitdepth == active_bitdepth);
+
+            if (can_direct_play) {
                 int bytes_to_copy = end_idx - fill_idx;
                     if (bytes_to_copy > 0) {
                         // --- FIX: READ INTO THE MASSIVE 64KB STREAM BUFFER, NOT PCM_TEMP! ---
